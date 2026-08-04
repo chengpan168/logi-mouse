@@ -1,5 +1,4 @@
 import AppKit
-import Foundation
 
 private func makeMainMenu() -> NSMenu {
     let mainMenu = NSMenu()
@@ -19,15 +18,10 @@ private func makeMainMenu() -> NSMenu {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let configuration: Configuration
     private var managerWindow: MouseManagerWindowController?
 
-    init(configuration: Configuration) {
-        self.configuration = configuration
-    }
-
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let controller = MouseManagerWindowController(configuration: configuration)
+        let controller = MouseManagerWindowController()
         managerWindow = controller
         controller.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -43,25 +37,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-do {
-    let configuration = try Configuration.parse(CommandLine.arguments.dropFirst())
-    if let captureURL = configuration.analyze {
-        let analysis = try ScrollCaptureAnalyzer.analyze(
-            fileURL: captureURL,
-            directionMapping: configuration.scrollDirection
-        )
-        print(analysis)
-        exit(EXIT_SUCCESS)
-    }
-    let application = NSApplication.shared
-    application.setActivationPolicy(.regular)
-    application.mainMenu = makeMainMenu()
-    let delegate = AppDelegate(configuration: configuration)
-    application.delegate = delegate
-    application.run()
-} catch ConfigurationError.helpRequested {
-    print(commandHelp)
-} catch {
-    fputs("error: \(error.localizedDescription)\n\n\(commandHelp)\n", stderr)
-    exit(EXIT_FAILURE)
-}
+let application = NSApplication.shared
+application.setActivationPolicy(.regular)
+application.mainMenu = makeMainMenu()
+let delegate = AppDelegate()
+application.delegate = delegate
+application.run()
