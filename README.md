@@ -274,6 +274,8 @@ SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/module-cache" \
 
 `build-app.sh` 使用 ad-hoc 签名，只适合本机调试。正式分发必须使用统一发布脚本；它会拒绝脏工作区，执行 Developer ID Application 与 Hardened Runtime 签名、Apple notarization、票据装订和最终校验，并生成带 commit 与 SHA-256 的发布清单：
 
+0.1.0 的用户可见变更、系统要求和已知限制见 [`docs/release-notes-0.1.0.md`](docs/release-notes-0.1.0.md)。
+
 ```zsh
 export LOGI_MOUSE_DEVELOPER_ID_APPLICATION='Developer ID Application: Example (TEAMID)'
 export LOGI_MOUSE_NOTARY_PROFILE='logi-mouse-notary'
