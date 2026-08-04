@@ -2,9 +2,8 @@ import Testing
 @testable import LogiMouse
 
 @Test func runtimeProcessesOnlyLongHIDPPReports() {
-    #expect(HIDPPProtocol.shouldProcessInputReport(reportID: 0x11, capturesRawReports: false))
-    #expect(!HIDPPProtocol.shouldProcessInputReport(reportID: 0x02, capturesRawReports: false))
-    #expect(HIDPPProtocol.shouldProcessInputReport(reportID: 0x02, capturesRawReports: true))
+    #expect(HIDPPProtocol.isLongInputReport(0x11))
+    #expect(!HIDPPProtocol.isLongInputReport(0x02))
 }
 
 @Test func buildsRootFeatureDiscoveryRequest() {

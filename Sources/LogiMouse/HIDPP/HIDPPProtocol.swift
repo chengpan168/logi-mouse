@@ -9,8 +9,8 @@ enum HIDPPProtocol {
     static let hiResWheelFeatureID: UInt16 = 0x2121
     static let thumbwheelFeatureID: UInt16 = 0x2150
 
-    static func shouldProcessInputReport(reportID: UInt32, capturesRawReports: Bool) -> Bool {
-        capturesRawReports || reportID == UInt32(longReportID)
+    static func isLongInputReport(_ reportID: UInt32) -> Bool {
+        reportID == UInt32(longReportID)
     }
 
     struct RequestHeader: Equatable, Sendable {

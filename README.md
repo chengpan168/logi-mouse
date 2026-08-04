@@ -1,48 +1,28 @@
 # logi-mouse
 
-这是一个使用 Swift / AppKit 编写的 macOS 滚轮研究与验证程序。项目最初用于把 Logi Options+ 当作黑盒采集 MX Master 3 的滚轮数据；目前已经完成曲线分析、连续动力学模型、离线回放、测试区闭环，以及 USB Receiver 模式下的独立全局滚动。
+这是一个使用 Swift / AppKit 编写的 macOS 鼠标滚动控制程序。项目基于早期对 Logi Options+ 的黑盒曲线研究，在 USB Receiver 模式下独立提供主滚轮和横向滚轮的全局平滑滚动。
 
 当前结论：在已验证的 USB Receiver 模式下，项目已经可以在所有应用中独立复现 Options+ 的滚动手感。Receiver HID++ 主动接管会动态发现主滚轮 `0x2121` 和横向拇指滚轮 `0x2150`，分别启用 Diverted 模式，并在关闭接管或退出应用时恢复各自原生设置。Options+ Agent 停止、模式漂移、Receiver 拔插、睡眠唤醒、全局输出和 Command-Q 恢复均已完成主滚轮真机验证。Bluetooth、SmartShift、按键、手势和 DPI 尚未替代，因此暂时不要卸载 Options+。
 
-## 本轮成果
+## 算法与运行时成果
 
-- 建立了从 HID++ 原始报告到页面实际位移的统一时间线采集链路。
-- 录制了慢速、快速自然停止、快速硬停止、反向和超慢精细滚动五类有效样本。
+- 历史研究阶段完成了慢速、快速自然停止、快速硬停止、反向和超慢精细滚动五类样本分析。
 - 确认 Options+ 的主要映射不是“慢速/快速”离散状态机，而是带历史衰减的连续 S 形增益曲线。
 - 使用一个连续活动量、Logistic 增益、`periods` 展开和小数误差扩散模型复现滚动输出。
 - 五组离线回放的总距离误差均低于 2%，其中反向场景为 0.0028%。
-- 实现了测试区域内的原始事件抑制和模型事件注入，不会形成注入反馈环。
+- 实现全局原始事件抑制和带 marker 的模型事件注入，不会形成反馈环。
 - 横向拇指滚轮通过 HID++ `0x2150` 获取未加速的原始位移，使用与主滚轮相同的 Logistic 增益参数，但独立维护活动量和小数余量；Receiver 接管期间会抑制重复的 macOS 横向事件。
-- 完成了逐事件 Live 闭环验证：模型输出、注入的 CGEvent 和 NSEvent 完全一致。
-- 完成长时间主观体验验证，实际体感与 Options+ 无明显差异。
-- 修复了离线分析器误把 `model_output` 当作 HID 输入的问题。
+- 历史逐事件闭环和长时间主观体验均已验证，实际体感与 Options+ 无明显差异。
 - 实现 Receiver HID++ Root Feature 动态发现、`0x2121` 模式读写、写后校验和原模式恢复。
 - 接管后的短期窗口每秒静默核对设备模式，稳定后降为每 15 秒；若出现外部滚动事件会立即触发一次限频核对。Options+ 退出或其他进程把 `0x03` 改回原生模式时，仍会自动重写并校验，而不需要人工切换开关。
 - 接管意图与当前 USB 连接解耦；Receiver 断开时进入等待，重新出现后优先以约 0.35 秒超时快速重试上次设备槽位，并周期性执行全槽位兜底扫描。
-- Live 模型默认仍限定在测试区；新增独立的全局输出开关，用于把同一条已验证曲线应用到所有应用。
-- 新增默认的 `Runtime (low overhead)` 常驻模式：只保留生命周期、HID++ 控制与异常记录，不再落盘每个滚轮事件，也不启动 120 Hz 视图采样。
-- 保留 `Diagnostic (full capture)` 完整采集模式，继续支持原始曲线分析和逐层闭环验证。
-- JSONL 写入改为后台缓冲批量写盘，滚轮事件回调不再等待磁盘 I/O；注入事件复用 `CGEventSource`，减少热路径对象创建。
-- Runtime 从 `IOHIDManager` 设备匹配阶段就只打开 Receiver 的 vendor-defined HID++ 接口，不订阅鼠标/键盘 collection；同时采用自适应模式守护，降低鼠标静止时的进程唤醒与无线轮询。
+- 主应用不再包含采集入口、JSONL 写盘、测试滚动区或离线分析 CLI；历史代码归档到 `Diagnostics/LegacyCapture/`，不参与产品编译。
+- `IOHIDManager` 只打开 Receiver 的 vendor-defined HID++ 接口，不订阅鼠标/键盘 collection；同时采用自适应模式守护，降低鼠标静止时的进程唤醒与无线轮询。
 
 
 ## 数据链路
 
-观察模式不改变滚动事件：
-
-```text
-IOHIDManager → HID++ raw report → Options+ CGEvent → NSEvent → NSScrollView offset
-```
-
-Live model 开启且鼠标位于测试区域内时：
-
-```text
-HID++ 0x2121 → ScrollDynamicsModel → CGScrollInjector → NSEvent → NSScrollView
-                         ↑
-Options+ CGEvent → CGEvent tap 抑制
-```
-
-开启实验性的 Receiver 主动接管后：
+开启平滑滚动后：
 
 ```text
 Receiver Root Feature ─┬→ 0x2121 主滚轮 → Diverted + High Resolution ─┐
@@ -51,13 +31,13 @@ Receiver Root Feature ─┬→ 0x2121 主滚轮 → Diverted + High Resolution 
                      独立轴状态 → ScrollDynamicsModel → CGScrollInjector
 ```
 
-两个轴共享同一组衰减和 S 形增益参数，但不会共享滚动历史，避免快速纵向滚动意外抬高横向增益。`0x2150` 的事件格式与模式控制依据 [OpenLogi thumbwheel 参考](https://openlogi.org/en/hidpp/features/x2150-thumbwheel)。应用注入的事件带有专用 marker，事件监听器会识别并放行，避免反馈环。鼠标移出测试区域后，原始系统/Options+ 滚动会立即恢复。
+两个轴共享同一组衰减和 S 形增益参数，但不会共享滚动历史，避免快速纵向滚动意外抬高横向增益。`0x2150` 的事件格式与模式控制依据 [OpenLogi thumbwheel 参考](https://openlogi.org/en/hidpp/features/x2150-thumbwheel)。应用注入的事件带有专用 marker，事件监听器会识别并放行，避免反馈环。
 
 ## 曲线分析
 
 ### 有效录制场景
 
-本轮用于拟合的 Options+ 黑盒录制如下，默认位于：
+历史拟合使用的 Options+ 黑盒录制如下；这些文件不再由当前主应用生成：
 
 ```text
 ~/Library/Application Support/logi-mouse/captures/
@@ -231,7 +211,7 @@ SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/module-cache" \
 .build/logi-mouse.app
 ```
 
-当前测试集包含曲线计算、衰减、低速误差扩散、方向反转、`periods` 展开、录制分析、采集模式过滤、Runtime HID++ 报告过滤、横纵轴事件分类、缓冲日志刷新，以及主滚轮/横向轮 HID++ 请求构造、事件解码、响应匹配、动态 feature、模式位解析和原生恢复等 26 项测试。
+当前产品测试集包含曲线计算、衰减、低速误差扩散、方向反转、`periods` 展开、连接方式识别、HID++ 报告过滤、横纵轴分类，以及主滚轮/横向轮请求构造、事件解码、响应匹配、动态 feature、模式位解析和原生恢复等 21 项测试。
 
 当前机器的 `xcode-select` 指向 Command Line Tools，而其 SDK 与系统 Swift 小版本不匹配。因此构建脚本和上面的测试命令都显式使用 `/Applications/Xcode.app` 工具链，无需修改全局 `xcode-select`。
 
@@ -239,21 +219,20 @@ SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/module-cache" \
 
 1. 构建并打开 `.build/logi-mouse.app`。
 2. 在“系统设置 → 隐私与安全性 → 输入监控”中允许应用读取 HID 输入。
-3. 若要使用 Live model，同时在“辅助功能”中允许应用监听和注入事件。
+3. 若要使用平滑滚动，同时在“辅助功能”中允许应用监听和注入事件。
 4. 修改权限后完全退出并重新打开应用。
-5. 日常使用保持默认的 `Runtime (low overhead)`；只有需要重新采集曲线或排查逐事件链路时才选择 `Diagnostic (full capture)`。
-6. 第一阶段先保持 Options+ 运行，将鼠标指针放在测试滚动区域内，再开启 `Live model (test area only)`。
-7. 勾选 `Active Receiver takeover (experimental)`；只有状态栏显示 `ACTIVE Receiver takeover` 后，才表示 `0x2121` 动态发现、模式写入和回读校验全部成功。
-8. 默认模式仍只作用于测试区；需要跨应用使用时，再显式勾选 `Global output (all apps, experimental)`。
-9. 全局模式出现异常时可立即按 `Command-Q`。取消接管、停止录制或退出应用都会保留反向偏好、启用 High Resolution，并清除 Diverted 位，使滚轮恢复原生 HID `0x02` 输出。
+5. 主界面会显示当前设备连接方式；USB Receiver 可以开启平滑滚动，Bluetooth 当前仅显示连接状态，尚未开放接管。
+6. 使用“自然滚动 / 标准滚动”分段按钮切换方向，选择会被保存。
+7. 打开“平滑滚动”总开关后，应用会依次启用模型、接管并校验 Receiver、开启全局输出，不再需要手工组合多个实验开关。
+8. 出现异常时可立即关闭总开关或按 `Command-Q`。关闭或退出应用都会恢复接管前的硬件模式。
 
 应用提供标准的 `Quit logi-mouse` 菜单项；点击菜单或按 `Command-Q` 都会先执行同步模式恢复，再结束进程。
 
-Live model 和全局输出默认关闭。只开启 Live model 时仍限定在测试区，便于 A/B；全局输出必须单独显式开启。
+平滑滚动默认关闭。主界面不包含采集或诊断控件。
 
 ### 后台进程架构
 
-当前采用单 App、单进程架构：窗口/未来的菜单栏入口、HID++ Receiver 接管、滚动模型、CGEvent 抑制与注入，以及退出前的原生模式恢复，都运行在 `logi-mouse` 进程中。窗口隐藏或关闭并不需要额外的 Agent 才能后台工作；产品化时可在同一进程增加 `NSStatusItem` 和登录启动。
+当前采用单 App、单进程架构：窗口/未来的菜单栏入口、HID++ Receiver 接管、滚动模型、CGEvent 抑制与注入，以及退出前的原生模式恢复，都运行在 `logi-mouse` 进程中。最小化窗口时滚动继续工作；关闭主窗口或退出应用会安全恢复原生模式并结束进程。产品化时可在同一进程增加 `NSStatusItem` 和登录启动。
 
 暂不拆分独立 Agent，原因是滚轮链路对接管所有权和退出恢复顺序敏感。双进程会额外引入 IPC、状态同步、重复接管和异常退出时由谁恢复 `0x02` 的协调成本。只有未来明确要求“UI 完全退出但滚动服务必须继续”、权限/沙箱隔离或独立崩溃拉起时，再拆成后台 Agent 与配置 UI 两个进程。
 
@@ -273,82 +252,30 @@ Live model 和全局输出默认关闭。只开启 Live model 时仍限定在测
 
 两个脚本均可重复执行。它们只管理当前用户的 `com.logi.cp-dev-mgr` LaunchAgent，不卸载 Options+，也不停止系统级 Updater。
 
-## 录制与离线分析
+## 历史采集代码
 
-从 `.app` 启动时，JSONL 默认写入：
+采集功能已从主应用下线。产品 target 不创建 JSONL、不注册原始 HID value 回调，也不包含测试滚动区和离线分析命令。
 
-```text
-~/Library/Application Support/logi-mouse/captures/
-```
+历史实现保留在 `Diagnostics/LegacyCapture/`：
 
-也可以通过命令行指定场景、时长和输出文件：
+- `Sources/`：采集 Coordinator、JSONL Logger、EventRecord、配置解析、测试窗口和离线 Analyzer。
+- `Tests/`：采集配置、日志和离线回放测试。
 
-```bash
-.build/release/logi-mouse \
-  --scenario options-on-free-spin-fast-natural-stop-down \
-  --diagnostic-capture \
-  --duration 15 \
-  --output captures/sample.jsonl
-```
-
-分析已有录制：
-
-```bash
-.build/release/logi-mouse \
-  --analyze "/path/to/capture.jsonl" \
-  --natural-scroll
-```
-
-关闭自然滚动时使用 `--traditional-scroll`。该选项只翻转最终方向，不改变活动量和增益曲线。
-
-### Runtime 与 Diagnostic
-
-| 模式 | 默认 | 记录内容 | 适用场景 |
-| --- | --- | --- | --- |
-| `Runtime (low overhead)` | 是 | 启停、设备连接、HID++ 控制、模式漂移、重连和错误 | 日常全局滚动、长期常驻 |
-| `Diagnostic (full capture)` | 否 | Runtime 全部内容，以及 `hid_report`、`hid`、CGEvent、NSEvent、`model_output`、`view` | 曲线录制、回归分析、故障诊断 |
-
-Runtime 模式仍然实时解析 `0x2121` 并执行相同的滚动模型，只是不保存高频原始事件。其单个运行日志上限为 10 MiB；Diagnostic 模式不设上限，以免截断实验数据。两种模式都采用 64 KiB 或 1 秒触发的后台批量写盘，并在停止或退出时同步刷新。
-
-## JSONL 层级（Diagnostic 模式）
-
-| `layer` | 内容 |
-| --- | --- |
-| `hid_device` | 匹配到的 Logitech 接口、VID/PID 和 primary usage |
-| `hid_report` | 原始 input report、report ID、十六进制字节，以及解析后的 `0x2121` 滚轮字段 |
-| `hid` | 非零 Wheel/AC Pan element、usage、report ID 和设备信息 |
-| `cg_event` | line/fixed/point/raw/accelerated delta、phase、source PID 和注入 marker |
-| `ns_event` | 测试窗口实际收到的 precise delta 与 phase |
-| `view` | NSScrollView content offset、文档高度、视口高度和剩余距离 |
-| `live_model_enabled` | Live model 启用及当时配置 |
-| `live_model_disabled` | Live model 关闭 |
-| `live_model_bypassed` | HID 输入未进入模型及其原因 |
-| `global_output_enabled` / `global_output_disabled` | 全局模型输出的启用与关闭 |
-| `model_output` | 模型计算出的逻辑输出、增益、活动量和量化信息 |
-| `cg_event_suppressed` | 当前模型作用范围内被事件 tap 抑制的原始 Options+ 事件 |
-| `hidpp_feature_discovered` | Root Feature 返回的 `0x2121` 动态 feature index 和版本 |
-| `hidpp_request` / `hidpp_response` | 主动 HID++ 命令及匹配响应 |
-| `hidpp_wheel_mode_read` / `hidpp_wheel_mode_written` | 接管前、写入后和恢复后的模式值 |
-| `hidpp_takeover_ready` / `hidpp_takeover_restored` | 主动接管完成和原模式恢复确认 |
-| `hidpp_mode_drift_detected` / `hidpp_mode_reasserted` | 设备模式被外部改写，以及守护逻辑自动恢复接管 |
-| `hidpp_reacquire_ready` / `hidpp_reacquire_failed` | Receiver 重连后的自动接管结果 |
-| `hidpp_takeover_failed` / `hidpp_restore_failed` | 控制链路失败及恢复失败原因 |
-
-测试文档高度为 1,000,000 px，用于避免快速自由滚动过早触底，导致采不到完整的自然停止尾部。
+该目录不在 Swift Package target 中，不会进入 `logi-mouse.app`。后续需要重新采集时，可基于这里的快照单独恢复诊断工具，不影响产品运行链路。
 
 ## 关键代码
 
-- `Sources/LogiMouse/App/`：应用入口、管理窗口和测试滚动区域。
-- `Sources/LogiMouse/Capture/`：配置、采集编排、JSONL 记录和单调时钟。
+- `Sources/LogiMouse/App/`：应用入口、产品主界面和无落盘的滚动控制编排。
 - `Sources/LogiMouse/Input/`：IOHID 输入监听、CGEvent 抑制和像素事件注入。
 - `Sources/LogiMouse/HIDPP/`：HID++ 协议、报告解码、Receiver 接管及原模式恢复。
-- `Sources/LogiMouse/Scroll/`：连续滚动动力学模型和离线回放分析。
+- `Sources/LogiMouse/Scroll/`：连续滚动动力学模型。
+- `Diagnostics/LegacyCapture/`：已下线且不参与产品编译的历史采集工具。
 
 ## 当前边界与下一步
 
 当前已经验证的是 USB Receiver 下“滚动链路可以全局替代”，不是整个 Options+ 产品已被替代：
 
-- 已验证 USB Receiver 模式；Bluetooth 目前只有设备枚举能力，还没有完成实际滚轮链路验证。
+- 主界面已能实时显示 USB Receiver、Bluetooth 或未连接；Bluetooth 目前只有被动设备识别能力，还没有完成实际滚轮链路接管。
 - Receiver 的 HID++ `0x2121` feature index 已通过 Root Feature 动态发现；尚未覆盖 Bluetooth 传输对应的控制通道。
 - `0x2121` Diverted + High Resolution 配置、模式漂移恢复、断线重连、睡眠唤醒和原生恢复均已真机验证；SmartShift 尚未接管。
 - USB Receiver 断线重连已支持；USB Receiver 与 Bluetooth 之间的运行时切换尚未实现。

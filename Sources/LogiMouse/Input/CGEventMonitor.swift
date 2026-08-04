@@ -2,8 +2,6 @@ import CoreGraphics
 import Foundation
 
 enum CGScrollAxisClassifier {
-    /// Uses all public delta representations because different applications and
-    /// drivers populate point, fixed-point and line fields differently.
     static func isPrimarilyVertical(
         pointX: Double,
         pointY: Double,
@@ -33,68 +31,48 @@ enum CGEventMonitorError: LocalizedError {
     case tapCreationFailed
 
     var errorDescription: String? {
-        "Could not create the CGEvent tap. Check Input Monitoring and Accessibility permissions, then reopen the app."
+        "无法创建全局滚动监听。请检查输入监控和辅助功能权限，然后重新打开应用。"
     }
 }
 
-/// Session-wide scroll tap used both for diagnostics and for replacing native
-/// scrolling with model output. Injected events carry `eventMarker` and must
-/// always pass through; otherwise the tap would suppress its own output.
+/// Suppresses native scroll events only while verified model output is active.
+/// Events injected by this process carry `eventMarker` and always pass through,
+/// preventing an injection/suppression feedback loop.
 final class CGEventMonitor {
-    var shouldSuppressExternalScroll: (() -> Bool)?
+    var shouldSuppressVerticalScroll: (() -> Bool)?
     var shouldSuppressHorizontalScroll: (() -> Bool)?
     var onExternalScrollEvent: (() -> Void)?
 
-    private let logger: JSONLLogger
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
-    private var suppressExternalScroll = false
+    private var suppressionEnabled = false
 
-    init(logger: JSONLLogger) {
-        self.logger = logger
-    }
-
-    func start(suppressExternalScroll: Bool = false) throws {
-        self.suppressExternalScroll = suppressExternalScroll
+    func start(suppressionEnabled: Bool = false) throws {
+        self.suppressionEnabled = suppressionEnabled
         let mask = CGEventMask(1) << CGEventType.scrollWheel.rawValue
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: suppressExternalScroll ? .defaultTap : .listenOnly,
+            options: suppressionEnabled ? .defaultTap : .listenOnly,
             eventsOfInterest: mask,
             callback: { _, type, event, context in
-                guard let context else {
-                    return Unmanaged.passUnretained(event)
-                }
+                guard let context else { return Unmanaged.passUnretained(event) }
                 let monitor = Unmanaged<CGEventMonitor>.fromOpaque(context).takeUnretainedValue()
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                    if let tap = monitor.tap {
-                        CGEvent.tapEnable(tap: tap, enable: true)
-                    }
+                    if let tap = monitor.tap { CGEvent.tapEnable(tap: tap, enable: true) }
                     return Unmanaged.passUnretained(event)
                 }
-                guard type == .scrollWheel else {
-                    return Unmanaged.passUnretained(event)
-                }
-                let injected = event.getIntegerValueField(.eventSourceUserData) == CGScrollInjector.eventMarker
-                if !injected {
-                    monitor.onExternalScrollEvent?()
-                }
-                let isVertical = CGScrollAxisClassifier.isPrimarilyVertical(event)
-                let suppressVertical = isVertical
-                    && (monitor.shouldSuppressExternalScroll?() ?? false)
-                // Horizontal native events are suppressed only after 0x2150
-                // takeover succeeds. Before that point they are the only valid
-                // horizontal input and must remain untouched.
-                let suppressHorizontal = !isVertical
-                    && (monitor.shouldSuppressHorizontalScroll?() ?? false)
-                let suppress = monitor.suppressExternalScroll
-                    && !injected
-                    && (suppressVertical || suppressHorizontal)
-                if monitor.logger.records(layer: suppress ? "cg_event_suppressed" : "cg_event") {
-                    monitor.receive(event, suppressed: suppress)
-                }
-                if suppress { return nil }
+                guard type == .scrollWheel else { return Unmanaged.passUnretained(event) }
+
+                let injected = event.getIntegerValueField(.eventSourceUserData)
+                    == CGScrollInjector.eventMarker
+                if !injected { monitor.onExternalScrollEvent?() }
+
+                let vertical = CGScrollAxisClassifier.isPrimarilyVertical(event)
+                let shouldSuppress = vertical
+                    ? (monitor.shouldSuppressVerticalScroll?() ?? false)
+                    : (monitor.shouldSuppressHorizontalScroll?() ?? false)
+                if monitor.suppressionEnabled && !injected && shouldSuppress { return nil }
                 return Unmanaged.passUnretained(event)
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
@@ -113,14 +91,12 @@ final class CGEventMonitor {
     }
 
     func setSuppressionEnabled(_ enabled: Bool) throws {
-        guard enabled != suppressExternalScroll || tap == nil else { return }
+        guard enabled != suppressionEnabled || tap == nil else { return }
         stop()
         do {
-            try start(suppressExternalScroll: enabled)
+            try start(suppressionEnabled: enabled)
         } catch {
-            if enabled {
-                try? start(suppressExternalScroll: false)
-            }
+            if enabled { try? start(suppressionEnabled: false) }
             throw error
         }
     }
@@ -133,27 +109,6 @@ final class CGEventMonitor {
         if let tap {
             CFMachPortInvalidate(tap)
             self.tap = nil
-        }
-    }
-
-    private func receive(_ event: CGEvent, suppressed: Bool) {
-        let timestamp = UInt64(event.timestamp)
-        logger.write(layer: suppressed ? "cg_event_suppressed" : "cg_event", timestampNs: timestamp) { record in
-            record.lineDeltaY = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1))
-            record.lineDeltaX = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
-            record.fixedDeltaY = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1)
-            record.fixedDeltaX = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2)
-            record.pointDeltaY = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
-            record.pointDeltaX = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
-            record.rawDeltaY = event.getDoubleValueField(CGEventField(rawValue: 178)!)
-            record.rawDeltaX = event.getDoubleValueField(CGEventField(rawValue: 177)!)
-            record.acceleratedDeltaY = event.getDoubleValueField(CGEventField(rawValue: 176)!)
-            record.acceleratedDeltaX = event.getDoubleValueField(CGEventField(rawValue: 175)!)
-            record.isContinuous = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
-            record.scrollPhase = event.getIntegerValueField(.scrollWheelEventScrollPhase)
-            record.momentumPhase = event.getIntegerValueField(.scrollWheelEventMomentumPhase)
-            record.scrollCount = event.getIntegerValueField(.scrollWheelEventScrollCount)
-            record.sourcePID = event.getIntegerValueField(.eventSourceUnixProcessID)
         }
     }
 

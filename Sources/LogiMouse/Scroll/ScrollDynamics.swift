@@ -23,7 +23,7 @@ struct ScrollDynamicsParameters: Equatable, Sendable {
     var activityMidpoint: Double
     var steepness: Double
 
-    static let optionsCaptureInitial = ScrollDynamicsParameters(
+    static let fittedDefault = ScrollDynamicsParameters(
         decayTimeConstant: 0.080,
         minimumGain: 0.85,
         maximumGain: 5.75,
@@ -76,7 +76,7 @@ struct ScrollDynamicsModel: Sendable {
     private var lastRawDirection = 0
 
     init(
-        parameters: ScrollDynamicsParameters = .optionsCaptureInitial,
+        parameters: ScrollDynamicsParameters = .fittedDefault,
         directionMapping: ScrollDirectionMapping = .natural
     ) {
         self.parameters = parameters
