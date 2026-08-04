@@ -1,18 +1,26 @@
 import Foundation
 
 struct HIDPPWheelEvent: Equatable {
+    /// Receiver slot or 0xff direct-Bluetooth route copied from report byte 1.
     let deviceIndex: UInt8
+    /// Runtime index of feature 0x2121, not the stable feature ID itself.
     let featureIndex: UInt8
+    /// Upper nibble of byte 3; zero identifies the wheel movement notification.
     let eventID: UInt8
+    /// Low nibble is the sampling-period count used to expand batched reports.
     let flags: UInt8
+    /// Signed high-resolution displacement from bytes 5...6, before acceleration.
     let delta: Int
 }
 
 struct HIDPPThumbwheelEvent: Equatable {
     let deviceIndex: UInt8
     let featureIndex: UInt8
+    /// Signed raw horizontal rotation from feature 0x2150.
     let rotation: Int
+    /// Device-reported time since the previous thumbwheel sample.
     let timeElapsed: UInt16
+    /// Hardware rotation/touch state retained for future gesture semantics.
     let rotationStatus: UInt8
     let flags: UInt8
 }
@@ -36,6 +44,9 @@ enum HIDPPReportDecoder {
             return nil
         }
 
+        // Unsolicited notifications use software ID zero. Command replies use
+        // the non-zero tag assigned by HIDPPController and must not become
+        // physical wheel input.
         let eventID = bytes[3] >> 4
         let softwareID = bytes[3] & 0x0f
         guard eventID == 0, softwareID == 0 else { return nil }

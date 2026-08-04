@@ -5,6 +5,8 @@ enum CGScrollInjector {
     /// Marks events synthesized by this process so the suppressing event tap
     /// can pass them without creating an injection loop.
     static let eventMarker: Int64 = 0x4d58_5343_524f_4c4c
+    /// `.hidSystemState` posts at the same system layer as physical HID input,
+    /// making the result visible to every foreground application.
     private static let source = CGEventSource(stateID: .hidSystemState)
 
     static func post(pixelDelta: Int) {
@@ -33,7 +35,12 @@ enum CGScrollInjector {
               ) else {
             return
         }
+        // The marker is process-defined metadata, not a Logitech field. The
+        // event tap checks it before correlation so injected output is never
+        // mistaken for native input and suppressed recursively.
         event.setIntegerValueField(.eventSourceUserData, value: eventMarker)
+        // Continuous pixel events match trackpad/Options+ semantics. Omitting
+        // this flag lets applications interpret the values as wheel lines.
         event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
         event.post(tap: .cghidEventTap)
     }

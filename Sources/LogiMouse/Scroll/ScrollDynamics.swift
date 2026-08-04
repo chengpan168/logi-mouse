@@ -23,6 +23,8 @@ struct ScrollDynamicsParameters: Equatable, Sendable {
     var activityMidpoint: Double
     var steepness: Double
 
+    /// Joint fit across slow natural stop, fast natural stop, hard stop,
+    /// direction reversal and ultra-slow controlled recordings.
     static let fittedDefault = ScrollDynamicsParameters(
         decayTimeConstant: 0.080,
         minimumGain: 0.85,
@@ -92,6 +94,8 @@ struct ScrollDynamicsModel: Sendable {
     mutating func setDirectionMapping(_ mapping: ScrollDirectionMapping) {
         guard directionMapping != mapping else { return }
         directionMapping = mapping
+        // A remainder accumulated under the old sign must not leak into the
+        // first event after the user changes natural/standard direction.
         fractionalRemainder = 0
     }
 
@@ -111,6 +115,8 @@ struct ScrollDynamicsModel: Sendable {
         // whole Bluetooth batch.
         let periods = max(1, Int(flags & 0x0f))
         let rawDirection = delta.signum()
+        // Preserve activity across reversal because the physical wheel is
+        // still moving, but discard sub-pixel debt from the opposite sign.
         if rawDirection != 0, lastRawDirection != 0, rawDirection != lastRawDirection {
             fractionalRemainder = 0
         }
@@ -165,6 +171,8 @@ struct ScrollDynamicsModel: Sendable {
     }
 
     private mutating func decayActivity(elapsed: TimeInterval) {
+        // Leaky integration is continuous in real time, so identical hardware
+        // deltas accelerate less when separated by a longer physical pause.
         activity *= Foundation.exp(-elapsed / parameters.decayTimeConstant)
         if activity < 1e-12 {
             activity = 0
