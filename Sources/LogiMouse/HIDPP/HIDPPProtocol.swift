@@ -1,6 +1,42 @@
 import Foundation
 
+/// Physical path used to carry HID++ messages.
+///
+/// A Receiver forwards requests to pairing slots 1...6. A directly connected
+/// Bluetooth device has no receiver slot, so Logitech reserves index `0xff`
+/// for the device itself. Feature indices still have to be discovered on both
+/// transports; only the routing byte differs.
+enum HIDPPTransport: Equatable, Sendable, CustomStringConvertible {
+    case usbReceiver
+    case bluetooth
+
+    var directDeviceIndex: UInt8? {
+        switch self {
+        case .usbReceiver: nil
+        case .bluetooth: 0xff
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .usbReceiver: "USB Receiver"
+        case .bluetooth: "Bluetooth"
+        }
+    }
+
+    var selectionPriority: Int {
+        switch self {
+        case .usbReceiver: 0
+        case .bluetooth: 1
+        }
+    }
+}
+
 enum HIDPPProtocol {
+    static let shortReportID: UInt8 = 0x10
+    static let shortReportLength = 7
+    static let receiverConnectionSubID: UInt8 = 0x41
+
     // HID++ 2.0 uses report 0x11 for 20-byte long messages. Byte layout:
     // [report, device slot, feature index, function/software id, payload...].
     static let longReportID: UInt8 = 0x11
@@ -11,6 +47,30 @@ enum HIDPPProtocol {
 
     static func isLongInputReport(_ reportID: UInt32) -> Bool {
         reportID == UInt32(longReportID)
+    }
+
+    struct ReceiverConnectionEvent: Equatable, Sendable {
+        let deviceIndex: UInt8
+        let isConnected: Bool
+    }
+
+    /// HID++ 1.0 Receiver notification `10 <slot> 41 ...`.
+    /// Bit 6 of the device-info byte is the inverse link-status flag: zero
+    /// means the paired device is in range and its wireless link is active.
+    static func receiverConnectionEvent(
+        reportID: UInt32,
+        bytes: [UInt8]
+    ) -> ReceiverConnectionEvent? {
+        guard reportID == UInt32(shortReportID),
+              bytes.count >= shortReportLength,
+              bytes[0] == shortReportID,
+              bytes[1] >= 1,
+              bytes[1] <= 6,
+              bytes[2] == receiverConnectionSubID else { return nil }
+        return ReceiverConnectionEvent(
+            deviceIndex: bytes[1],
+            isConnected: bytes[4] & 0x40 == 0
+        )
     }
 
     struct RequestHeader: Equatable, Sendable {

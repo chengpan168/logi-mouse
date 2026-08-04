@@ -2,27 +2,30 @@ import Foundation
 import IOKit.hid
 
 enum HIDPPControllerError: LocalizedError, Equatable {
-    case noReceiverChannel
+    case noHIDPPChannel
     case deviceNotFound
     case featureUnsupported(UInt16)
     case writeFailed(IOReturn)
     case timeout
+    case transportChanged
     case deviceError(UInt8)
     case unexpectedResponse
     case verificationFailed(expected: UInt8, actual: UInt8)
 
     var errorDescription: String? {
         switch self {
-        case .noReceiverChannel:
-            "No writable Logitech Receiver HID++ channel is available."
+        case .noHIDPPChannel:
+            "No writable Logitech HID++ channel is available."
         case .deviceNotFound:
-            "No paired HID++ device responded on Receiver slots 1–6."
+            "No HID++ device responded on the active transport."
         case let .featureUnsupported(featureID):
             String(format: "The connected device does not expose HID++ feature 0x%04x.", featureID)
         case let .writeFailed(code):
             String(format: "IOHIDDeviceSetReport failed (IOReturn 0x%08x).", code)
         case .timeout:
-            "The HID++ request timed out. The mouse may be asleep or another process owns the Receiver."
+            "The HID++ request timed out. The mouse may be asleep or another process owns the device."
+        case .transportChanged:
+            "The mouse transport changed while a HID++ request was in progress."
         case let .deviceError(code):
             String(format: "The HID++ device returned error 0x%02x.", code)
         case .unexpectedResponse:
@@ -33,16 +36,17 @@ enum HIDPPControllerError: LocalizedError, Equatable {
     }
 }
 
-/// Serializes every mutating HID++ operation performed against the Logitech
-/// USB Receiver and owns the safety lifecycle of diverted wheel modes.
+/// Serializes every mutating HID++ operation performed against a Logitech
+/// Receiver or Bluetooth control channel and owns the safety lifecycle of
+/// diverted wheel modes.
 ///
 /// Hardware invariants:
 /// - Feature indices are device-specific and must be discovered from Root
 ///   Feature `0x0000`; captured indices are never trusted for control writes.
 /// - Before the first write, the original main-wheel and thumbwheel modes are
 ///   saved. Disable, failure and process termination restore those values.
-/// - Every mode write is followed by a read-back. A successful USB write only
-///   proves that the Receiver accepted bytes, not that the mouse applied them.
+/// - Every mode write is followed by a read-back. A successful transport write
+///   only proves that bytes were accepted, not that the mouse applied them.
 /// - Requests are serialized because HID++ exposes only a 4-bit software ID
 ///   for response matching and unsolicited events use the same input channel.
 ///
@@ -52,7 +56,7 @@ enum HIDPPControllerError: LocalizedError, Equatable {
 final class HIDPPController {
     enum State: Equatable, Sendable, CustomStringConvertible {
         case unavailable
-        case receiverReady
+        case channelReady(HIDPPTransport)
         case discovering
         case ready(deviceIndex: UInt8, featureIndex: UInt8, mode: HIDPPProtocol.WheelMode)
         case failed(String)
@@ -60,7 +64,7 @@ final class HIDPPController {
         var description: String {
             switch self {
             case .unavailable: "unavailable"
-            case .receiverReady: "receiver-ready"
+            case let .channelReady(transport): "channel-ready: \(transport)"
             case .discovering: "discovering"
             case let .ready(deviceIndex, featureIndex, mode):
                 String(
@@ -94,11 +98,17 @@ final class HIDPPController {
         let restoreInverted: Bool
     }
 
+    private struct Channel {
+        let device: IOHIDDevice
+        let key: UInt
+        let transport: HIDPPTransport
+    }
+
     private let operationQueue = DispatchQueue(label: "dev.logi-mouse.hidpp-controller")
     private let condition = NSCondition()
     private let stateLock = NSLock()
-    private var receiverDevice: IOHIDDevice?
-    private var receiverDeviceKey: UInt?
+    private var channels: [UInt: Channel] = [:]
+    private var selectedChannelKey: UInt?
     private var pendingRequest: PendingRequest?
     private var nextSoftwareID: UInt8 = 0x0a
     private var observedDeviceIndex: UInt8?
@@ -112,30 +122,30 @@ final class HIDPPController {
     private var watchdogInterval: TimeInterval = 1
     private var lastOnDemandVerificationNs: UInt64 = 0
     private var reacquireAttemptScheduled = false
-    private var reacquireAttempt = 0
-    // MARK: - Receiver lifecycle
+    // MARK: - HID++ channel lifecycle
 
-    func considerReceiverDevice(
+    func considerDevice(
         _ device: IOHIDDevice,
         key: UInt,
-        vendorID: Int?,
-        productID: Int?,
-        primaryUsagePage: Int?,
-        primaryUsage: Int?
+        transport: HIDPPTransport
     ) {
-        guard vendorID == 0x046d,
-              productID == 0xc52b,
-              primaryUsagePage == 0xff00,
-              primaryUsage == 1 else {
-            return
-        }
         stateLock.lock()
-        receiverDevice = device
-        receiverDeviceKey = key
+        channels[key] = Channel(device: device, key: key, transport: transport)
+        let previousKey = selectedChannelKey
+        selectedChannelKey = preferredChannelKeyLocked()
+        let selected = selectedChannelLocked()
+        let channelChanged = previousKey != selectedChannelKey
+        if channelChanged {
+            resetRouteStateLocked(for: selected?.transport)
+        }
         let shouldReacquire = takeoverRequested
         stateLock.unlock()
-        transition(to: .receiverReady)
-        log("hidpp_controller_device", "selected Receiver HID++ channel usage_page=0xff00 usage=1")
+
+        guard channelChanged, let selected else { return }
+        cancelPendingRequest()
+        operationQueue.async { [weak self] in self?.stopModeWatchdog() }
+        transition(to: .channelReady(selected.transport))
+        log("hidpp_controller_device", "selected \(selected.transport) HID++ channel")
         if shouldReacquire {
             scheduleReacquire(after: 0.15)
         }
@@ -143,26 +153,37 @@ final class HIDPPController {
 
     func removeDevice(key: UInt) {
         stateLock.lock()
-        let removed = receiverDeviceKey == key
-        if removed {
-            receiverDevice = nil
-            receiverDeviceKey = nil
-            featureIndices.removeAll()
-            thumbwheelFeatureIndices.removeAll()
-            activeWheel = nil
-            activeThumbwheel = nil
+        let wasSelected = selectedChannelKey == key
+        channels.removeValue(forKey: key)
+        if wasSelected {
+            selectedChannelKey = preferredChannelKeyLocked()
         }
+        let replacement = selectedChannelLocked()
+        if wasSelected { resetRouteStateLocked(for: replacement?.transport) }
+        let shouldReacquire = takeoverRequested
         stateLock.unlock()
-        if removed {
+
+        if wasSelected {
             operationQueue.async { [weak self] in
                 self?.stopModeWatchdog()
             }
-            condition.lock()
-            pendingRequest = nil
-            condition.broadcast()
-            condition.unlock()
-            transition(to: .unavailable)
-            log("hidpp_controller_device_removed", "Receiver HID++ channel removed")
+            cancelPendingRequest()
+            if let replacement {
+                transition(to: .channelReady(replacement.transport))
+                log("hidpp_controller_device", "fell back to \(replacement.transport) HID++ channel")
+                // A Receiver interface remains present even when its paired
+                // mouse is offline. Do not scan its slots merely because a
+                // Bluetooth channel disappeared; wait for the Receiver's
+                // 0x41 connection notification or actual HID++ activity.
+                if shouldReacquire, replacement.transport == .bluetooth {
+                    scheduleReacquire(after: 0.15)
+                } else if shouldReacquire {
+                    transition(to: .unavailable)
+                }
+            } else {
+                transition(to: .unavailable)
+                log("hidpp_controller_device_removed", "active HID++ channel removed")
+            }
         }
     }
 
@@ -177,6 +198,46 @@ final class HIDPPController {
             condition.broadcast()
         }
         condition.unlock()
+
+        // A report from a previously unavailable mouse is itself connection
+        // evidence. One event starts one recovery transaction; failures remain
+        // idle until another hardware/input event arrives.
+        stateLock.lock()
+        let shouldReacquire = takeoverRequested && activeWheel == nil
+        stateLock.unlock()
+        if shouldReacquire { scheduleReacquire(after: 0) }
+    }
+
+    func observeReceiverConnection(
+        deviceKey: UInt,
+        event: HIDPPProtocol.ReceiverConnectionEvent
+    ) {
+        stateLock.lock()
+        let isSelectedReceiver = selectedChannelKey == deviceKey
+            && channels[deviceKey]?.transport == .usbReceiver
+        if isSelectedReceiver, event.isConnected {
+            observedDeviceIndex = event.deviceIndex
+        }
+        let shouldReacquire = isSelectedReceiver && event.isConnected && takeoverRequested
+        if isSelectedReceiver, !event.isConnected {
+            activeWheel = nil
+            activeThumbwheel = nil
+            featureIndices.removeAll()
+            thumbwheelFeatureIndices.removeAll()
+        }
+        stateLock.unlock()
+
+        guard isSelectedReceiver else { return }
+        if event.isConnected {
+            log("hidpp_receiver_connected", "slot=\(event.deviceIndex)")
+            transition(to: .channelReady(.usbReceiver))
+            if shouldReacquire { scheduleReacquire(after: 0.05) }
+        } else {
+            operationQueue.async { [weak self] in self?.stopModeWatchdog() }
+            cancelPendingRequest()
+            transition(to: .unavailable)
+            log("hidpp_receiver_disconnected", "slot=\(event.deviceIndex)")
+        }
     }
 
     func observeWheelRoute(deviceIndex: UInt8, featureIndex: UInt8) {
@@ -195,7 +256,11 @@ final class HIDPPController {
 
     func verifyModeSoon() {
         operationQueue.async { [weak self] in
-            guard let self, self.isTakeoverRequested, self.hasActiveWheel else { return }
+            guard let self, self.isTakeoverRequested else { return }
+            guard self.hasActiveWheel else {
+                self.scheduleReacquire(after: 0)
+                return
+            }
             let now = MonotonicClock.nowNanoseconds()
             guard now >= self.lastOnDemandVerificationNs + 1_000_000_000 else { return }
             self.lastOnDemandVerificationNs = now
@@ -215,9 +280,15 @@ final class HIDPPController {
         return thumbwheelFeatureIndices[deviceIndex]
     }
 
+    func acceptsDevice(key: UInt) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return selectedChannelKey == key
+    }
+
     // MARK: - Public takeover lifecycle
 
-    func takeOverReceiverWheel(completion: @escaping (Result<State, Error>) -> Void) {
+    func takeOverWheel(completion: @escaping (Result<State, Error>) -> Void) {
         setTakeoverRequested(true)
         operationQueue.async { [weak self] in
             guard let self else { return }
@@ -243,7 +314,7 @@ final class HIDPPController {
         }
     }
 
-    func restoreReceiverWheel(completion: @escaping (Result<State, Error>) -> Void) {
+    func restoreWheel(completion: @escaping (Result<State, Error>) -> Void) {
         setTakeoverRequested(false)
         operationQueue.async { [weak self] in
             guard let self else { return }
@@ -294,8 +365,9 @@ final class HIDPPController {
 
     private func performTakeover(knownRouteOnly: Bool = false) throws -> State {
         transition(to: .discovering)
-        // Receiver slot numbers and feature indices can change after reconnect.
-        // Resolve both axes on every takeover instead of persisting addresses.
+        // Receiver slot numbers and feature indices can change after reconnect;
+        // Bluetooth always routes directly through 0xff. Resolve both feature
+        // indices on every takeover instead of persisting addresses.
         let deviceIndex = try discoverDeviceIndex(knownRouteOnly: knownRouteOnly)
         let feature = try discoverFeature(
             HIDPPProtocol.hiResWheelFeatureID,
@@ -410,8 +482,8 @@ final class HIDPPController {
         let activeThumbwheel = self.activeThumbwheel
         stateLock.unlock()
         guard activeWheel != nil || activeThumbwheel != nil else {
-            let available = currentReceiverDevice() != nil
-            let newState: State = available ? .receiverReady : .unavailable
+            let transport = currentTransport()
+            let newState: State = transport.map(State.channelReady) ?? .unavailable
             transition(to: newState)
             return newState
         }
@@ -481,9 +553,14 @@ final class HIDPPController {
             }
         }
         if let firstError { throw firstError }
-        transition(to: .receiverReady)
+        guard let transport = currentTransport() else {
+            transition(to: .unavailable)
+            return .unavailable
+        }
+        let restoredState = State.channelReady(transport)
+        transition(to: restoredState)
         log("hidpp_takeover_restored", restoredDescriptions.joined(separator: " "))
-        return .receiverReady
+        return restoredState
     }
 
     // MARK: - Feature discovery and commands
@@ -491,7 +568,11 @@ final class HIDPPController {
     private func discoverDeviceIndex(knownRouteOnly: Bool) throws -> UInt8 {
         stateLock.lock()
         let preferred = observedDeviceIndex
+        let directIndex = selectedChannelLocked()?.transport.directDeviceIndex
         stateLock.unlock()
+        if let directIndex {
+            return directIndex
+        }
         // Prefer the last observed slot for fast wake/reconnect recovery. Every
         // sixth reacquire performs a full 1...6 scan so a slot change cannot
         // permanently trap the controller on a stale route.
@@ -641,9 +722,20 @@ final class HIDPPController {
         timeout: TimeInterval,
         quietly: Bool = false
     ) throws -> [UInt8] {
-        guard let device = currentReceiverDevice() else {
-            throw HIDPPControllerError.noReceiverChannel
+        guard let channel = currentChannel() else {
+            throw HIDPPControllerError.noHIDPPChannel
         }
+        // A connection can switch while a takeover transaction is discovering
+        // features. Never send a Receiver slot route to a direct Bluetooth
+        // channel, or the Bluetooth 0xff route to a Receiver.
+        switch channel.transport {
+        case .usbReceiver where deviceIndex == 0xff,
+             .bluetooth where deviceIndex != 0xff:
+            throw HIDPPControllerError.transportChanged
+        default:
+            break
+        }
+        let device = channel.device
         let header = HIDPPProtocol.RequestHeader(
             deviceIndex: deviceIndex,
             featureIndex: featureIndex,
@@ -652,7 +744,7 @@ final class HIDPPController {
         )
         let report = HIDPPProtocol.makeLongRequest(header: header, payload: payload)
 
-        // Publish the expected header before sending. A fast Receiver can call
+        // Publish the expected header before sending. A fast HID++ channel can call
         // back from IOKit immediately after SetReport; publishing afterward
         // would race and lose a valid response.
         condition.lock()
@@ -739,22 +831,16 @@ final class HIDPPController {
                 guard let self else { return }
                 self.reacquireAttemptScheduled = false
                 guard self.isTakeoverRequested,
-                      self.currentReceiverDevice() != nil,
+                      self.currentDevice() != nil,
                       !self.hasActiveWheel else {
                     return
                 }
-                self.reacquireAttempt += 1
-                let knownRouteOnly = self.reacquireAttempt % 6 != 0
                 do {
-                    let ready = try self.performTakeover(knownRouteOnly: knownRouteOnly)
-                    self.reacquireAttempt = 0
+                    let ready = try self.performTakeover(knownRouteOnly: false)
                     self.log("hidpp_reacquire_ready", ready.description)
                 } catch {
                     self.transition(to: .failed(error.localizedDescription))
                     self.log("hidpp_reacquire_failed", error.localizedDescription)
-                    if self.isTakeoverRequested, self.currentReceiverDevice() != nil {
-                        self.scheduleReacquire(after: 0.35)
-                    }
                 }
             }
         }
@@ -854,7 +940,7 @@ final class HIDPPController {
             }
             // Check quickly during initial takeover and after repair. Once eight
             // consecutive checks are stable, reduce polling to preserve idle
-            // CPU and Receiver battery/radio activity.
+            // CPU and mouse battery/radio activity.
             if repairedDrift {
                 watchdogStableChecks = 0
                 setWatchdogInterval(1)
@@ -865,8 +951,17 @@ final class HIDPPController {
                 }
             }
         } catch {
-            watchdogStableChecks = 0
-            setWatchdogInterval(15)
+            // A missing response means the active mouse is gone or asleep.
+            // Stop polling completely. Bluetooth arrival, Receiver 0x41, a
+            // HID++ report, or a native scroll event will trigger one recovery.
+            stateLock.lock()
+            self.activeWheel = nil
+            self.activeThumbwheel = nil
+            self.featureIndices.removeAll()
+            self.thumbwheelFeatureIndices.removeAll()
+            stateLock.unlock()
+            stopModeWatchdog()
+            transition(to: .unavailable)
             log("hidpp_mode_watchdog_failed", error.localizedDescription)
         }
     }
@@ -880,10 +975,53 @@ final class HIDPPController {
         condition.unlock()
     }
 
-    private func currentReceiverDevice() -> IOHIDDevice? {
+    private func currentDevice() -> IOHIDDevice? {
+        currentChannel()?.device
+    }
+
+    private func currentChannel() -> Channel? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return receiverDevice
+        return selectedChannelLocked()
+    }
+
+    private func currentTransport() -> HIDPPTransport? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return selectedChannelLocked()?.transport
+    }
+
+    private func preferredChannelKeyLocked() -> UInt? {
+        channels.values.max { lhs, rhs in
+            if lhs.transport.selectionPriority == rhs.transport.selectionPriority {
+                return lhs.key < rhs.key
+            }
+            return lhs.transport.selectionPriority < rhs.transport.selectionPriority
+        }?.key
+    }
+
+    private func selectedChannelLocked() -> Channel? {
+        guard let selectedChannelKey else { return nil }
+        return channels[selectedChannelKey]
+    }
+
+    /// Route addresses are valid only within one physical transport. Clearing
+    /// them on a channel switch prevents a Receiver slot/feature index from
+    /// being written to a Bluetooth device (or the reverse). For Bluetooth the
+    /// direct route is known up-front, while feature indices remain discoverable.
+    private func resetRouteStateLocked(for transport: HIDPPTransport?) {
+        observedDeviceIndex = transport?.directDeviceIndex
+        featureIndices.removeAll()
+        thumbwheelFeatureIndices.removeAll()
+        activeWheel = nil
+        activeThumbwheel = nil
+    }
+
+    private func cancelPendingRequest() {
+        condition.lock()
+        pendingRequest = nil
+        condition.broadcast()
+        condition.unlock()
     }
 
     private var hasActiveWheel: Bool {

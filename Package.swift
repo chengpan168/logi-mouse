@@ -8,8 +8,15 @@ let package = Package(
         .executable(name: "logi-mouse", targets: ["LogiMouse"])
     ],
     targets: [
+        .target(
+            name: "HIDReportBridge",
+            path: "Sources/HIDReportBridge",
+            publicHeadersPath: "include",
+            linkerSettings: [.linkedFramework("IOKit")]
+        ),
         .executableTarget(
             name: "LogiMouse",
+            dependencies: ["HIDReportBridge"],
             path: "Sources/LogiMouse",
             linkerSettings: [
                 .linkedFramework("AppKit"),
@@ -19,7 +26,7 @@ let package = Package(
         ),
         .testTarget(
             name: "LogiMouseTests",
-            dependencies: ["LogiMouse"],
+            dependencies: ["LogiMouse", "HIDReportBridge"],
             path: "Tests/LogiMouseTests"
         )
     ],

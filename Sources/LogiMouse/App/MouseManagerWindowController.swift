@@ -22,6 +22,8 @@ final class MouseManagerWindowController: NSWindowController {
     private let statusLabel = NSTextField(wrappingLabelWithString: "正在初始化…")
 
     private var connection: MouseConnection = .disconnected
+    private var detectedConnection: MouseConnection = .disconnected
+    private var runtimeConnectionUnavailable = false
     private var smoothTransitionInProgress = false
 
     init() {
@@ -185,9 +187,36 @@ final class MouseManagerWindowController: NSWindowController {
             DispatchQueue.main.async { self?.statusLabel.stringValue = status }
         }
         connectionMonitor.onConnectionChange = { [weak self] connection in
-            self?.connection = connection
-            self?.updateConnectionUI(connection)
-            self?.updateSmoothControlAvailability()
+            guard let self else { return }
+            self.detectedConnection = connection
+            if connection == .disconnected || !self.runtimeConnectionUnavailable {
+                self.applyConnection(connection)
+            }
+        }
+        coordinator.onControllerStateChange = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .unavailable, .failed:
+                self.runtimeConnectionUnavailable = true
+                self.applyConnection(.disconnected)
+            case let .channelReady(transport):
+                // A Bluetooth interface exists only while its mouse link is
+                // alive. For Receiver transport this state is also emitted by
+                // the 0x41 link-up notification handled in HIDMonitor.
+                self.runtimeConnectionUnavailable = false
+                let detected = self.detectedConnection
+                switch (transport, detected) {
+                case (.bluetooth, .bluetooth), (.usbReceiver, .usbReceiver):
+                    self.applyConnection(detected)
+                default:
+                    break
+                }
+            case .ready:
+                self.runtimeConnectionUnavailable = false
+                self.applyConnection(self.detectedConnection)
+            case .discovering:
+                break
+            }
         }
     }
 
@@ -203,7 +232,7 @@ final class MouseManagerWindowController: NSWindowController {
         }
         guard connection.supportsSmoothScrolling else {
             smoothScrollingSwitch.state = .off
-            showError("当前仅支持 USB Receiver；Bluetooth 平滑接管将在后续实现。")
+            showError("未检测到支持 HID++ 平滑滚动的 Logitech 鼠标。")
             return
         }
 
@@ -214,7 +243,7 @@ final class MouseManagerWindowController: NSWindowController {
             finishSmoothEnable(.failure(error))
             return
         }
-        coordinator.setReceiverTakeoverEnabled(true) { [weak self] result in
+        coordinator.setTakeoverEnabled(true) { [weak self] result in
             self?.finishSmoothEnable(result)
         }
     }
@@ -237,11 +266,11 @@ final class MouseManagerWindowController: NSWindowController {
     private func disableSmoothScrolling() {
         setSmoothTransition(true)
         coordinator.setGlobalOutputEnabled(false)
-        guard coordinator.isReceiverTakeoverEnabled else {
+        guard coordinator.isTakeoverEnabled else {
             finishSmoothDisable()
             return
         }
-        coordinator.setReceiverTakeoverEnabled(false) { [weak self] result in
+        coordinator.setTakeoverEnabled(false) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success:
@@ -292,6 +321,12 @@ final class MouseManagerWindowController: NSWindowController {
         case .usbReceiver: deviceIcon.contentTintColor = .systemGreen
         case .bluetooth: deviceIcon.contentTintColor = .systemBlue
         }
+    }
+
+    private func applyConnection(_ connection: MouseConnection) {
+        self.connection = connection
+        updateConnectionUI(connection)
+        updateSmoothControlAvailability()
     }
 
     private func setSmoothTransition(_ inProgress: Bool) {

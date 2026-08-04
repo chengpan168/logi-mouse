@@ -1,9 +1,26 @@
 import Testing
 @testable import LogiMouse
 
+@Test func transportUsesReceiverSlotsAndBluetoothDirectIndex() {
+    #expect(HIDPPTransport.usbReceiver.directDeviceIndex == nil)
+    #expect(HIDPPTransport.bluetooth.directDeviceIndex == 0xff)
+    #expect(HIDPPTransport.bluetooth.selectionPriority > HIDPPTransport.usbReceiver.selectionPriority)
+}
+
 @Test func runtimeProcessesOnlyLongHIDPPReports() {
     #expect(HIDPPProtocol.isLongInputReport(0x11))
     #expect(!HIDPPProtocol.isLongInputReport(0x02))
+}
+
+@Test func decodesReceiverConnectionLifecycleNotification() {
+    let connected: [UInt8] = [0x10, 0x02, 0x41, 0x04, 0x21, 0x34, 0x12]
+    let disconnected: [UInt8] = [0x10, 0x02, 0x41, 0x04, 0x61, 0x34, 0x12]
+
+    #expect(HIDPPProtocol.receiverConnectionEvent(reportID: 0x10, bytes: connected)
+        == .init(deviceIndex: 2, isConnected: true))
+    #expect(HIDPPProtocol.receiverConnectionEvent(reportID: 0x10, bytes: disconnected)
+        == .init(deviceIndex: 2, isConnected: false))
+    #expect(HIDPPProtocol.receiverConnectionEvent(reportID: 0x11, bytes: connected) == nil)
 }
 
 @Test func buildsRootFeatureDiscoveryRequest() {

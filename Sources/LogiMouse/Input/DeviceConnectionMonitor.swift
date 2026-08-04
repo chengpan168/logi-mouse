@@ -7,8 +7,10 @@ enum MouseConnection: Equatable, Sendable {
     case bluetooth(product: String)
 
     var supportsSmoothScrolling: Bool {
-        if case .usbReceiver = self { return true }
-        return false
+        switch self {
+        case .usbReceiver, .bluetooth: true
+        case .disconnected: false
+        }
     }
 
     var displayName: String {
@@ -44,7 +46,11 @@ struct HIDDeviceIdentity: Equatable, Sendable {
 enum MouseConnectionResolver {
     static let logitechVendorID = 0x046d
     static let unifyingReceiverProductID = 0xc52b
-    static let supportedBluetoothProductIDs: Set<Int> = [0xb033]
+    // MX Master 3, MX Master 3 for Mac and MX Master 3S Bluetooth identities.
+    // The HID++ listener additionally requires the vendor-defined control
+    // collection, so these IDs never cause the normal pointer collection to be
+    // opened for control traffic.
+    static let supportedBluetoothProductIDs: Set<Int> = [0xb023, 0xb033, 0xb034]
 
     static func resolve(_ devices: [HIDDeviceIdentity]) -> MouseConnection {
         // Prefer a directly connected Bluetooth mouse over a Receiver entry if
@@ -69,11 +75,18 @@ enum MouseConnectionResolver {
     }
 }
 
-/// Observes IORegistry device arrival/removal without opening HID input
-/// collections. This is deliberately separate from `HIDMonitor`: connection
-/// badges must work before Input Monitoring permission is granted, and merely
-/// displaying a device must not subscribe to high-frequency pointer reports.
+/// Observes IORegistry HID-interface arrival/removal without opening HID input
+/// collections. Bluetooth HID devices are published as `IOHIDInterface`
+/// services; tracking that concrete service is important because its lifetime
+/// follows the Bluetooth link, while broader HID device objects may remain in
+/// the registry after the physical mouse has disconnected.
+///
+/// This is deliberately separate from `HIDMonitor`: connection badges must
+/// work before Input Monitoring permission is granted, and merely displaying a
+/// device must not subscribe to high-frequency pointer reports.
 final class DeviceConnectionMonitor {
+    private static let registryServiceClass = "IOHIDInterface"
+
     var onConnectionChange: ((MouseConnection) -> Void)?
 
     private var notificationPort: IONotificationPortRef?
@@ -94,7 +107,7 @@ final class DeviceConnectionMonitor {
         IOServiceAddMatchingNotification(
             port,
             kIOFirstMatchNotification,
-            IOServiceMatching("IOHIDDevice"),
+            IOServiceMatching(Self.registryServiceClass),
             { context, iterator in
                 guard let context else { return }
                 Unmanaged<DeviceConnectionMonitor>.fromOpaque(context)
@@ -107,7 +120,7 @@ final class DeviceConnectionMonitor {
         IOServiceAddMatchingNotification(
             port,
             kIOTerminatedNotification,
-            IOServiceMatching("IOHIDDevice"),
+            IOServiceMatching(Self.registryServiceClass),
             { context, iterator in
                 guard let context else { return }
                 Unmanaged<DeviceConnectionMonitor>.fromOpaque(context)

@@ -18,7 +18,7 @@ import Testing
     #expect(connection.supportsSmoothScrolling)
 }
 
-@Test func resolvesBluetoothAndMarksItUnsupportedForTakeover() {
+@Test func resolvesBluetoothAndMarksItSupportedForTakeover() {
     let connection = MouseConnectionResolver.resolve([
         HIDDeviceIdentity(
             registryID: 2,
@@ -32,7 +32,7 @@ import Testing
     ])
 
     #expect(connection == .bluetooth(product: "MX Master 3 for Mac"))
-    #expect(!connection.supportsSmoothScrolling)
+    #expect(connection.supportsSmoothScrolling)
 }
 
 @Test func ignoresUnrelatedHIDDevices() {
