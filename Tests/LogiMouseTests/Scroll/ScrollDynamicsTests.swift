@@ -19,6 +19,22 @@ private let constantGainParameters = ScrollDynamicsParameters(
     #expect(output.activityAfterInput == 4)
 }
 
+@Test func batchedBluetoothPeriodsMatchIndividualUSBReports() {
+    var batched = ScrollDynamicsModel()
+    var individual = ScrollDynamicsModel()
+
+    // Establish the same preceding state and timestamp on both transports.
+    _ = batched.process(delta: -2, flags: 0x11, timestampNs: 0)
+    _ = individual.process(delta: -2, flags: 0x11, timestampNs: 0)
+
+    let bluetooth = batched.process(delta: -3, flags: 0x12, timestampNs: 16_000_000)
+    let usbFirst = individual.process(delta: -3, flags: 0x11, timestampNs: 8_000_000)
+    let usbSecond = individual.process(delta: -3, flags: 0x11, timestampNs: 16_000_000)
+
+    #expect(bluetooth.pixelDeltas == usbFirst.pixelDeltas + usbSecond.pixelDeltas)
+    #expect(abs(bluetooth.activityAfterInput - usbSecond.activityAfterInput) < 1e-12)
+}
+
 @Test func naturalAndTraditionalDirectionsAreExactOpposites() {
     var natural = ScrollDynamicsModel(parameters: constantGainParameters, directionMapping: .natural)
     var traditional = ScrollDynamicsModel(parameters: constantGainParameters, directionMapping: .traditional)
@@ -38,7 +54,7 @@ private let constantGainParameters = ScrollDynamicsParameters(
         activityMidpoint: 3,
         steepness: 8
     )
-    var model = ScrollDynamicsModel(parameters: parameters)
+    var model = ScrollDynamicsModel(parameters: parameters, minimumInjectableGain: 0)
 
     let first = model.process(delta: -2, flags: 0x11, timestampNs: 1_000_000)
     let second = model.process(delta: -2, flags: 0x11, timestampNs: 1_000_000_000)
@@ -46,6 +62,17 @@ private let constantGainParameters = ScrollDynamicsParameters(
     #expect(first.pixelDeltas == [-1])
     #expect(second.pixelDeltas == [-2])
     #expect(first.totalPixels + second.totalPixels == -3)
+}
+
+@Test func isolatedMinimumWheelUnitIsNeverQuantizedAway() {
+    var model = ScrollDynamicsModel()
+
+    let first = model.process(delta: -1, flags: 0x11, timestampNs: 0)
+    model.reset()
+    let reverse = model.process(delta: 1, flags: 0x11, timestampNs: 1_000_000_000)
+
+    #expect(first.pixelDeltas == [-1])
+    #expect(reverse.pixelDeltas == [1])
 }
 
 @Test func activityUsesContinuousDecayAndRaisesGain() {
@@ -61,7 +88,7 @@ private let constantGainParameters = ScrollDynamicsParameters(
     #expect(second.gain < third.gain)
     #expect(third.gain > 3)
     #expect(fourth.gain > 5)
-    #expect(afterPause.gain < 1)
+    #expect(afterPause.gain == 1)
 }
 
 @Test func reversingDirectionClearsOnlyFractionalRemainder() {
@@ -72,7 +99,7 @@ private let constantGainParameters = ScrollDynamicsParameters(
         activityMidpoint: 3,
         steepness: 8
     )
-    var model = ScrollDynamicsModel(parameters: parameters)
+    var model = ScrollDynamicsModel(parameters: parameters, minimumInjectableGain: 0)
 
     _ = model.process(delta: -2, flags: 0x11, timestampNs: 0)
     let activityBeforeReverse = model.activity

@@ -69,6 +69,10 @@ struct ScrollDynamicsOutput: Equatable, Sendable {
 struct ScrollDynamicsModel: Sendable {
     private(set) var parameters: ScrollDynamicsParameters
     private(set) var directionMapping: ScrollDirectionMapping
+    /// Core Graphics' broadly supported point-delta field is integer-valued.
+    /// Keep the fitted 0.85 low-speed curve for analysis, but use a 1.0 runtime
+    /// floor so an isolated one-unit hardware movement cannot quantize to zero.
+    private let minimumInjectableGain: Double
     private(set) var activity: Double = 0
     private(set) var fractionalRemainder: Double = 0
 
@@ -77,10 +81,12 @@ struct ScrollDynamicsModel: Sendable {
 
     init(
         parameters: ScrollDynamicsParameters = .fittedDefault,
-        directionMapping: ScrollDirectionMapping = .natural
+        directionMapping: ScrollDirectionMapping = .natural,
+        minimumInjectableGain: Double = 1.0
     ) {
         self.parameters = parameters
         self.directionMapping = directionMapping
+        self.minimumInjectableGain = minimumInjectableGain
     }
 
     mutating func setDirectionMapping(_ mapping: ScrollDirectionMapping) {
@@ -98,13 +104,12 @@ struct ScrollDynamicsModel: Sendable {
 
     mutating func process(delta: Int, flags: UInt8, timestampNs: UInt64) -> ScrollDynamicsOutput {
         // Low four flag bits encode how many sampling periods the reported
-        // displacement represents. Expanding periods into separate CGEvents
-        // preserves the event cadence observed in the original capture.
+        // displacement represents. Bluetooth commonly batches more periods in
+        // one HID++ notification than the USB receiver. Replaying each period
+        // through the complete model makes those two transport shapes
+        // mathematically equivalent instead of applying one stale gain to the
+        // whole Bluetooth batch.
         let periods = max(1, Int(flags & 0x0f))
-        decayActivity(at: timestampNs)
-
-        let activityBeforeInput = activity
-        let gain = parameters.gain(activity: activityBeforeInput)
         let rawDirection = delta.signum()
         if rawDirection != 0, lastRawDirection != 0, rawDirection != lastRawDirection {
             fractionalRemainder = 0
@@ -112,20 +117,39 @@ struct ScrollDynamicsModel: Sendable {
 
         var pixelDeltas: [Int] = []
         pixelDeltas.reserveCapacity(periods)
-        let signedExactDelta = Double(delta * directionMapping.multiplier) * gain
+        let elapsedPerPeriod: TimeInterval?
+        if let lastTimestampNs, timestampNs >= lastTimestampNs {
+            elapsedPerPeriod = Double(timestampNs - lastTimestampNs)
+                / 1_000_000_000
+                / Double(periods)
+        } else {
+            elapsedPerPeriod = nil
+        }
+
+        var activityBeforeInput = activity
+        var firstGain = max(minimumInjectableGain, parameters.gain(activity: activity))
         // Error diffusion carries sub-pixel output forward instead of rounding
         // each event independently. This is what keeps extremely slow code-view
         // scrolling responsive without introducing a minimum one-pixel jump.
-        for _ in 0..<periods {
+        for period in 0..<periods {
+            if let elapsedPerPeriod {
+                decayActivity(elapsed: elapsedPerPeriod)
+            }
+            let gain = max(minimumInjectableGain, parameters.gain(activity: activity))
+            if period == 0 {
+                activityBeforeInput = activity
+                firstGain = gain
+            }
+            let signedExactDelta = Double(delta * directionMapping.multiplier) * gain
             fractionalRemainder += signedExactDelta
             let pixels = Int(fractionalRemainder.rounded(.towardZero))
             fractionalRemainder -= Double(pixels)
             if pixels != 0 {
                 pixelDeltas.append(pixels)
             }
+            activity += Double(abs(delta))
         }
 
-        activity += Double(abs(delta) * periods)
         if rawDirection != 0 {
             lastRawDirection = rawDirection
         }
@@ -133,16 +157,14 @@ struct ScrollDynamicsModel: Sendable {
 
         return ScrollDynamicsOutput(
             pixelDeltas: pixelDeltas,
-            gain: gain,
+            gain: firstGain,
             activityBeforeInput: activityBeforeInput,
             activityAfterInput: activity,
             periods: periods
         )
     }
 
-    private mutating func decayActivity(at timestampNs: UInt64) {
-        guard let lastTimestampNs, timestampNs >= lastTimestampNs else { return }
-        let elapsed = Double(timestampNs - lastTimestampNs) / 1_000_000_000
+    private mutating func decayActivity(elapsed: TimeInterval) {
         activity *= Foundation.exp(-elapsed / parameters.decayTimeConstant)
         if activity < 1e-12 {
             activity = 0

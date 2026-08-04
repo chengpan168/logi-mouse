@@ -4,14 +4,15 @@ import Foundation
 ///
 /// This coordinator contains no capture, file logging or test-surface logic.
 /// It owns only the production path:
-/// Receiver HID++ event → independent axis model → marked global CGEvent.
+/// HID++ wheel event → independent axis model → marked global CGEvent.
 final class MouseControlCoordinator {
     private(set) var isRunning = false
     private(set) var isLiveModelEnabled = false
-    private(set) var isReceiverTakeoverEnabled = false
+    private(set) var isTakeoverEnabled = false
     private(set) var isGlobalOutputEnabled = false
 
     var onStatusChange: ((String) -> Void)?
+    var onControllerStateChange: ((HIDPPController.State) -> Void)?
 
     private var hidMonitor: HIDMonitor?
     private var eventMonitor: CGEventMonitor?
@@ -30,29 +31,33 @@ final class MouseControlCoordinator {
             self?.processHorizontal(event, timestampNs: timestamp)
         }
         hidMonitor.onControllerStateChange = { [weak self] state in
-            guard let self, self.isReceiverTakeoverEnabled else { return }
+            guard let self else { return }
+            self.onControllerStateChange?(state)
+            guard self.isTakeoverEnabled else { return }
             switch state {
             case .unavailable:
-                self.onStatusChange?("USB Receiver 已断开，等待重新连接…")
-            case .receiverReady, .discovering:
-                self.onStatusChange?("正在恢复 Receiver 滚轮接管…")
+                self.onStatusChange?("鼠标 HID++ 通道已断开，等待重新连接…")
+            case let .channelReady(transport):
+                self.onStatusChange?("正在通过 \(transport) 恢复滚轮接管…")
+            case .discovering:
+                self.onStatusChange?("正在重新发现鼠标滚轮能力…")
             case .ready:
                 self.onStatusChange?("平滑滚动已开启")
             case let .failed(message):
-                self.onStatusChange?("Receiver 恢复重试中：\(message)")
+                self.onStatusChange?("鼠标连接恢复重试中：\(message)")
             }
         }
         let shouldSuppress: () -> Bool = { [weak self] in
             guard let self else { return false }
             return self.isLiveModelEnabled
-                && self.isReceiverTakeoverEnabled
+                && self.isTakeoverEnabled
                 && self.isGlobalOutputEnabled
         }
         eventMonitor.shouldSuppressVerticalScroll = shouldSuppress
         eventMonitor.shouldSuppressHorizontalScroll = shouldSuppress
         eventMonitor.onExternalScrollEvent = { [weak self] in
-            guard let self, self.isReceiverTakeoverEnabled else { return }
-            self.hidMonitor?.verifyReceiverWheelModeSoon()
+            guard let self, self.isTakeoverEnabled else { return }
+            self.hidMonitor?.verifyWheelModeSoon()
         }
 
         do {
@@ -86,12 +91,12 @@ final class MouseControlCoordinator {
         }
     }
 
-    func setReceiverTakeoverEnabled(
+    func setTakeoverEnabled(
         _ enabled: Bool,
         completion: @escaping (Result<HIDPPController.State, Error>) -> Void
     ) {
         guard isRunning, let hidMonitor else {
-            completion(.failure(HIDPPControllerError.noReceiverChannel))
+            completion(.failure(HIDPPControllerError.noHIDPPChannel))
             return
         }
         if enabled {
@@ -99,15 +104,15 @@ final class MouseControlCoordinator {
                 completion(.failure(MouseControlRequirementError.liveModelRequired))
                 return
             }
-            onStatusChange?("正在接管 USB Receiver 滚轮…")
-            hidMonitor.takeOverReceiverWheel { [weak self] result in
-                if case .success = result { self?.isReceiverTakeoverEnabled = true }
+            onStatusChange?("正在接管鼠标滚轮…")
+            hidMonitor.takeOverWheel { [weak self] result in
+                if case .success = result { self?.isTakeoverEnabled = true }
                 completion(result)
             }
         } else {
             onStatusChange?("正在恢复系统原生滚动…")
-            hidMonitor.restoreReceiverWheel { [weak self] result in
-                if case .success = result { self?.isReceiverTakeoverEnabled = false }
+            hidMonitor.restoreWheel { [weak self] result in
+                if case .success = result { self?.isTakeoverEnabled = false }
                 completion(result)
             }
         }
@@ -134,7 +139,7 @@ final class MouseControlCoordinator {
         hidMonitor = nil
         isRunning = false
         isLiveModelEnabled = false
-        isReceiverTakeoverEnabled = false
+        isTakeoverEnabled = false
         isGlobalOutputEnabled = false
         resetModels()
     }
@@ -175,7 +180,7 @@ final class MouseControlCoordinator {
     }
 
     private var outputIsActive: Bool {
-        isLiveModelEnabled && isReceiverTakeoverEnabled && isGlobalOutputEnabled
+        isLiveModelEnabled && isTakeoverEnabled && isGlobalOutputEnabled
     }
 
     private func resetModels() {
@@ -188,6 +193,6 @@ enum MouseControlRequirementError: LocalizedError {
     case liveModelRequired
 
     var errorDescription: String? {
-        "必须先启用平滑滚动模型，才能接管 Receiver。"
+        "必须先启用平滑滚动模型，才能接管鼠标滚轮。"
     }
 }
