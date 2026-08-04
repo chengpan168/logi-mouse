@@ -12,10 +12,18 @@ bool LMShouldForwardHIDReport(
 
 /// IOHID raw-report callback used by Swift.
 ///
-/// Bluetooth exposes pointer report 0x02 and HID++ report 0x11 through one
-/// composite IOHIDDevice. Filtering here prevents high-frequency pointer
-/// traffic from crossing the C/Swift boundary while preserving HID++ 0x11
-/// reports and the Receiver's low-frequency 0x10 connection notifications.
+/// Hardware boundary:
+/// - USB Receiver exposes HID++ as a dedicated vendor interface. Its report
+///   0x10 carries seven-byte Receiver lifecycle notifications and report 0x11
+///   carries twenty-byte HID++ 2.0 messages.
+/// - Bluetooth exposes keyboard report 0x01, pointer report 0x02 and HID++
+///   report 0x11 through one composite IOHIDDevice.
+///
+/// IOHIDDevice input-report callbacks are registered for the whole device, not
+/// for one Report ID. macOS therefore wakes this C callback for every Bluetooth
+/// pointer movement. Rejecting 0x01/0x02 here prevents allocation, locking and
+/// Swift ARC work on that hot path. It cannot prevent the initial process wake,
+/// because Report ID filtering is unavailable below this callback in IOHIDLib.
 void LMHIDPPFilteredReportCallback(
     void * _Nullable context,
     IOReturn result,

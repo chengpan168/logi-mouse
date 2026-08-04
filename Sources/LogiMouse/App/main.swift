@@ -33,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // This is the last safety boundary for hardware mode restoration.
+        // Command-Q, menu Quit and normal window termination all converge here.
         managerWindow?.prepareForTermination()
     }
 }

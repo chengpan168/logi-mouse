@@ -1,24 +1,78 @@
 # logi-mouse
 
-这是一个使用 Swift / AppKit 编写的 macOS 鼠标滚动控制程序。项目基于早期对 Logi Options+ 的黑盒曲线研究，通过 USB Receiver 或 Bluetooth HID++ 通道独立提供主滚轮和横向滚轮的全局平滑滚动。
+这是一个使用 Swift / AppKit 编写的 macOS Logitech 鼠标控制程序。它基于对 Logi Options+ 的黑盒数据分析，通过 USB Receiver 或 Bluetooth HID++ 通道，为主滚轮和横向拇指滚轮提供全局平滑滚动。
 
-当前结论：USB Receiver 与 Bluetooth 均已完成 MX Master 真机接管、滚动、重连和原生恢复验证。HID++ 主动接管会动态发现主滚轮 `0x2121` 和横向拇指滚轮 `0x2150`，分别启用 Diverted 模式，并在关闭接管或退出应用时恢复各自原生设置。Bluetooth 使用直连设备索引 `0xff`，并与 Receiver 复用相同的 raw-report 解码、滚动算法、守护和恢复链路。SmartShift、按键、手势和 DPI 尚未替代，因此暂时不要卸载 Options+。
+当前已完成 MX Master 3 Mac 的两种连接方式、双滚轮接管、自然/标准方向切换、模式校验和退出恢复。滚动体感已通过离线数据和真机体验验证，与 Options+ 无明显差异。SmartShift、DPI、按键和手势不在当前范围内，因此暂时不要卸载 Options+。
 
-## 算法与运行时成果
+## 阅读导航
 
-- 历史研究阶段完成了慢速、快速自然停止、快速硬停止、反向和超慢精细滚动五类样本分析。
-- 确认 Options+ 的主要映射不是“慢速/快速”离散状态机，而是带历史衰减的连续 S 形增益曲线。
-- 使用一个连续活动量、Logistic 增益、`periods` 展开和小数误差扩散模型复现滚动输出。
-- 五组离线回放的总距离误差均低于 2%，其中反向场景为 0.0028%。
-- 实现全局原始事件抑制和带 marker 的模型事件注入，不会形成反馈环。
-- 横向拇指滚轮通过 HID++ `0x2150` 获取未加速的原始位移，使用与主滚轮相同的 Logistic 增益参数，但独立维护活动量和小数余量；接管期间会抑制重复的 macOS 横向事件。
-- 历史逐事件闭环和长时间主观体验均已验证，实际体感与 Options+ 无明显差异。
-- 实现 Receiver/Bluetooth HID++ Root Feature 动态发现、`0x2121` 模式读写、写后校验和原模式恢复。
-- 接管后的短期窗口每秒静默核对设备模式，稳定后降为每 15 秒；若出现外部滚动事件会立即触发一次限频核对。Options+ 退出或其他进程把 `0x03` 改回原生模式时，仍会自动重写并校验，而不需要人工切换开关。
-- 接管意图与当前物理连接解耦；Receiver 使用 1...6 槽位发现，Bluetooth 使用 `0xff` 直连路由。连接切换时丢弃旧 transport 的槽位和 feature index，再通过 Root Feature 重新发现能力。
-- 主应用不再包含采集入口、JSONL 写盘、测试滚动区或离线分析 CLI；历史代码归档到 `Diagnostics/LegacyCapture/`，不参与产品编译。
-- Receiver 将 HID++ 暴露为独立的 `0xff00/1` collection；Bluetooth 则把键盘、指针和 `0xff43/0x0202` HID++ 合并在一个 IOHIDDevice 中。两种传输都使用不丢边界和时间戳的 raw-report callback；Bluetooth 的普通指针 `0x02` 报告在极小的 C bridge 中直接丢弃，只有 HID++ `0x11` 进入 Swift。模式守护采用自适应频率，降低鼠标静止时的进程唤醒与无线轮询。
+- 想直接使用：阅读[快速开始](#快速开始)和[运行与权限](#运行与权限)。
+- 想了解硬件差异：阅读[USB Receiver 与 Bluetooth 的区别](#usb-receiver-与-bluetooth-的区别)。
+- 想了解踩过的坑：阅读[问题复盘](#问题复盘)。
+- 想了解滚动算法：阅读[曲线分析](#曲线分析)和[离线验证结果](#离线验证结果)。
+- 想参与开发：阅读[构建与测试](#构建与测试)和[关键代码](#关键代码)。
 
+## 快速开始
+
+```zsh
+./scripts/build-app.sh
+open .build/logi-mouse.app
+```
+
+首次运行需要在“系统设置 → 隐私与安全性”中开启“输入监控”和“辅助功能”，然后完全退出并重新打开应用。在主界面确认连接方式后，打开“平滑滚动”即可；关闭开关或按 `Command-Q` 会恢复鼠标的原生滚动模式。
+
+## 当前能力与边界
+
+- 动态发现 HID++ Root Feature，以及主滚轮 `0x2121`、横向轮 `0x2150`。
+- 分别启用两个滚轮的 Diverted 模式，写后回读校验，并在关闭或退出时恢复原设置。
+- 两个轴使用同一条连续 Logistic 增益曲线，但独立保存活动量和小数余量。
+- 支持自然滚动和标准滚动；方向只在输出端转换，不改变幅度曲线。
+- USB Receiver 使用槽位 `1...6`；Bluetooth 使用直连索引 `0xff`。切换传输时会清除旧路由并重新发现 feature index。
+- 主应用不再包含数据采集和分析界面；历史工具位于 `Diagnostics/LegacyCapture/`，不参与产品编译。
+
+## USB Receiver 与 Bluetooth 的区别
+
+两种连接最终复用相同的 HID++ 解码和滚动算法，但 macOS 暴露给应用的设备拓扑不同：
+
+| 项目 | USB Receiver | Bluetooth Low Energy |
+| --- | --- | --- |
+| HID 拓扑 | HID++ 是独立的 `0xff00/1` interface | 键盘、指针和 `0xff43/0x0202` HID++ 位于同一个复合 interface |
+| HID++ 路由 | Receiver 槽位 `1...6` | 直连设备索引 `0xff` |
+| 滚轮报告 | 通常是单周期报告 | 可能把多个采样合并在 `periods` 中 |
+| 指针事件 | 选中的 HID++ interface 不接收指针报告 | 同一 raw callback 会收到 `0x02` 指针和 `0x11` HID++ 报告 |
+| CPU 表现 | 移动指针不会唤醒 logi-mouse | 系统会先唤醒回调；C bridge 在进入 Swift 前丢弃 `0x02`，只能降低成本，不能消除底层唤醒 |
+| 连接事件 | Receiver 保持插入；通过 `0x10/0x41` 通知判断配对设备上线/离线 | 通过 `IOHIDInterface` 到达和终止判断连接 |
+| 重连方式 | 收到 Receiver 连接通知、HID++ 活动或原生滚动后恢复一次 | Bluetooth interface 重新出现后恢复一次 |
+
+Bluetooth 慢速滚动曾因 parsed-element `IOHIDQueue` 合并和调度时序出现停顿。最终两种传输都改用保留原始边界和时间戳的 raw-report callback，并按 `periods` 展开，因此超慢和快速滚动已经使用同一条数据路径。Bluetooth 的复合接口决定了指针移动仍会唤醒进程；评估过 HIDDriverKit，但它同样需要接管整个复合 interface，还会引入系统驱动竞争和发布 entitlement，当前不采用。
+
+## 问题复盘
+
+下面只保留对后续维护有价值的问题、根因和最终处理方式：
+
+| 问题 | 根因 | 处理与结论 |
+| --- | --- | --- |
+| 采集入口启动后没有数据 | 输入监控授权属于具体 App，Codex/终端子进程不会自动继承 | 使用独立签名 App 采集；启动后先确认文件和采集窗口，再开始动作 |
+| 同时存在多个旧实例 | 调试阶段重复启动 App，旧进程仍持有 HID/事件监听 | 重启前退出旧实例；产品只保留单 App、单进程架构 |
+| Options+ 退出后仍影响滚动 | UI 退出不代表 `com.logi.cp-dev-mgr` Agent 停止 | 单独管理 Agent；验证时明确记录 Options+ Agent 和权限状态 |
+| 停掉 Options+ 后滚动行为突变 | Agent 同时维护 MagSpeed/设备模式，不只是生成滚动曲线 | 先完成 HID++ 主动接管和原生恢复，再停用 Agent，不能把“停 Agent”当作天然干净基线 |
+| 工程名称和主界面仍像调试工具 | 早期代码沿用旧调试名称和采集测试界面 | 统一命名为 `logi-mouse`，建立产品设置界面，采集代码移入 `Diagnostics/LegacyCapture/` |
+| 是否需要独立后台 Agent | UI 和滚动服务拆进程会产生接管所有权、IPC 和异常恢复问题 | 当前保持单 App、单进程；只有未来要求 UI 退出后服务继续运行时再拆分 |
+| 是否启用 App Sandbox | 全局 HID、输入监听和 CGEvent 注入需要系统级能力和隐私授权 | 当前应用不启用 App Sandbox，仍要求用户显式授予输入监控和辅助功能权限 |
+| 录制场景数据不足或动作错误 | 窗口过短、滚到底、动作混入或场景名称与无级滚轮不一致 | 放大可滚动范围；每组独立录制；错误操作废弃，以最后一次有效操作为准 |
+| 状态机难以同时拟合慢速、快速和反向 | 输出增益具有连续平台和历史依赖，不是几个速度挡位 | 使用“指数衰减活动量 + Logistic S 曲线 + 误差扩散”，状态只保留方向和连续量 |
+| 超慢滚动偶尔丢失 | 低速增益产生小于 1 px 的结果，整数 CGEvent 直接舍入为零 | 保存小数余量并误差扩散；孤立最小单位至少注入 `1 px` |
+| 自然滚动方向容易重复反转 | 设备、macOS 和应用都可能处理方向 | 幅度模型与方向解耦，只在最终输出应用自然/标准方向乘数，主滚轮和横向轮一致 |
+| 横向滚轮失效或不跟手 | 初期只接管 `0x2121`，横向轮仍走不同的系统路径 | 增加 `0x2150` 动态发现和 Diverted 模式；复用主滚轮算法但使用独立轴状态 |
+| 测试区可能混入 Options+ 输出 | 模型输出与 Options+ 原始事件同时存在 | 使用同轴、时间窗口和 period 配额抑制原始事件；注入事件加 marker 防止反馈环 |
+| `Command-Q` 不能退出或退出后滚轮异常 | 退出路径没有先同步恢复硬件模式 | 标准菜单和终止流程统一执行同步恢复，再结束进程 |
+| 静止时 CPU 仍约 `0.5%` | 高频队列、固定轮询和调试链路持续唤醒 | 下线采集入口，改 raw-report callback；守护稳定后降频，失联后完全停止轮询 |
+| 蓝牙快速滚动慢且卡顿 | Bluetooth 报告可能批量携带多个 `periods`，旧路径丢失时序 | 使用 raw report 并逐 period 展开，现与 USB 使用同一模型 |
+| 蓝牙超慢滚动“停一下、滚一下” | parsed-element queue 不保留原始报告边界，Run Loop 调度放大低速间隔 | 放弃 IOHIDQueue，USB/Bluetooth 统一使用 raw-report callback |
+| 蓝牙移动指针时 CPU 高于 USB | Bluetooth 把指针 `0x02` 和 HID++ `0x11` 放在同一复合 interface | C 层在 Swift 前过滤指针报告；这是 Apple HID 拓扑带来的剩余差异 |
+| 报错 `No HID++ device responded...` | 传输切换后仍使用旧槽位/feature，或 Bluetooth 匹配方式不正确 | 切换时清理路由；Receiver 重新扫描槽位，Bluetooth 使用 `0xff` 并重新发现 feature |
+| 鼠标断开后主界面仍显示连接 | 只根据泛化设备或已插入 Receiver 判断，未跟踪真实接口和链路 | Bluetooth 跟踪 `IOHIDInterface` 生命周期；Receiver 解析 `0x10/0x41` 链路通知 |
+| 鼠标断开后不断重试扫描 | 接管意图保留后，失败路径每 `0.35 s` 递归重试 | 改为事件驱动；一次事件只恢复一次，失败后等待下一次硬件或输入事件 |
 
 ## 数据链路
 
@@ -212,9 +266,21 @@ SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/module-cache" \
 .build/logi-mouse.app
 ```
 
-当前产品测试集包含曲线计算、衰减、低速量化下限、误差扩散、方向反转、Bluetooth 批量 periods 与 USB 单周期等价性、连接方式识别、Bluetooth 直连路由、C 层 HID++ 报告过滤、横纵轴分类，以及主滚轮/横向轮请求构造、事件解码、响应匹配、动态 feature、模式位解析和原生恢复等 25 项测试。
+当前产品测试集包含曲线计算、衰减、低速量化下限、误差扩散、方向反转、Bluetooth 批量 periods 与 USB 单周期等价性、连接方式识别、Bluetooth 直连路由、C 层报告过滤、Receiver 连接通知、分轴接管安全门、滚动事件关联和按需校验限频，以及主滚轮/横向轮请求构造、事件解码、响应匹配、动态 feature、模式位解析和原生恢复等 30 项测试。
 
 当前机器的 `xcode-select` 指向 Command Line Tools，而其 SDK 与系统 Swift 小版本不匹配。因此构建脚本和上面的测试命令都显式使用 `/Applications/Xcode.app` 工具链，无需修改全局 `xcode-select`。
+
+### 正式发布
+
+`build-app.sh` 使用 ad-hoc 签名，只适合本机调试。正式分发必须使用统一发布脚本；它会拒绝脏工作区，执行 Developer ID Application 与 Hardened Runtime 签名、Apple notarization、票据装订和最终校验，并生成带 commit 与 SHA-256 的发布清单：
+
+```zsh
+export LOGI_MOUSE_DEVELOPER_ID_APPLICATION='Developer ID Application: Example (TEAMID)'
+export LOGI_MOUSE_NOTARY_PROFILE='logi-mouse-notary'
+./scripts/release-app.sh
+```
+
+`LOGI_MOUSE_NOTARY_PROFILE` 需要预先通过 `xcrun notarytool store-credentials` 保存到登录钥匙串。正式产物为 `.build/logi-mouse-notarized.zip`，不要分发 ad-hoc 调试包。
 
 ## 运行与权限
 
@@ -266,22 +332,96 @@ SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/module-cache" \
 
 ## 关键代码
 
-- `Sources/LogiMouse/App/`：应用入口、产品主界面和无落盘的滚动控制编排。
-- `Sources/HIDReportBridge/`：Bluetooth 复合设备的 C 层 raw-report 过滤，只允许 HID++ `0x11` 跨入 Swift。
-- `Sources/LogiMouse/Input/`：IOHID 输入监听、CGEvent 抑制和像素事件注入。
-- `Sources/LogiMouse/HIDPP/`：HID++ 协议、报告解码、Receiver/Bluetooth 路由、接管及原模式恢复。
-- `Sources/LogiMouse/Scroll/`：连续滚动动力学模型。
-- `Diagnostics/LegacyCapture/`：已下线且不参与产品编译的历史采集工具。
+### 目录结构
+
+```text
+Sources/
+├── HIDReportBridge/                  # 高频 raw report 的 C 层过滤边界
+│   ├── HIDReportBridge.c
+│   └── include/HIDReportBridge.h
+└── LogiMouse/
+    ├── App/
+    │   ├── main.swift                # AppKit 入口和统一退出恢复入口
+    │   ├── MouseManagerWindowController.swift
+    │   └── MouseControlCoordinator.swift
+    ├── Input/
+    │   ├── DeviceConnectionMonitor.swift  # 无需输入监控权限的连接状态
+    │   ├── HIDMonitor.swift               # IOHIDManager 和 raw-report 生命周期
+    │   ├── CGEventMonitor.swift            # 原生滚动识别与安全抑制
+    │   └── CGScrollInjector.swift          # 全局连续像素事件注入
+    ├── HIDPP/
+    │   ├── HIDPPProtocol.swift        # Report ID、字节布局、feature 与模式位
+    │   ├── HIDPPReportDecoder.swift   # 0x2121/0x2150 物理事件解码
+    │   └── HIDPPController.swift      # 硬件事务、路由、回读、恢复和重连
+    ├── Scroll/
+    │   └── ScrollDynamics.swift       # 衰减活动量、Logistic 增益和误差扩散
+    └── Support/
+        └── MonotonicClock.swift       # HID 时间戳与限频使用的单调时钟
+
+Tests/LogiMouseTests/                 # 协议、曲线、桥接和抑制安全测试
+Diagnostics/LegacyCapture/            # 已下线、不参与产品编译的采集工具
+```
+
+### 模块职责
+
+| 模块 | 可以做什么 | 不应该做什么 |
+| --- | --- | --- |
+| `MouseManagerWindowController` | 展示连接和设置、响应用户操作 | 解析 HID 字节或直接写硬件 |
+| `MouseControlCoordinator` | 组合 HID、模型、抑制和注入，管理输出安全门 | 保存 feature index 或实现协议细节 |
+| `DeviceConnectionMonitor` | 只读观察 `IOHIDInterface` 到达/终止，更新界面 | 打开 HID 输入或判断 Receiver 无线链路 |
+| `HIDMonitor` | 匹配硬件、维护 report buffer/callback、分发完整报告 | 决定滚轮模式或滚动增益 |
+| `HIDPPController` | 串行执行发现、读写、回读、恢复和事件驱动重连 | 生成 CGEvent 或处理 UI |
+| `ScrollDynamicsModel` | 将未加速硬件位移映射为像素序列 | 访问 IOHID/CGEvent 或区分 USB/Bluetooth |
+| `CGEventMonitor/Injector` | 安全抑制目标原生事件并注入带 marker 的像素事件 | 推断 HID++ feature 或修改设备模式 |
+| `HIDReportBridge` | 在 C 层过滤 Bluetooth 高频指针报告 | 解析业务事件或持有 Swift 对象所有权 |
+
+### 三条核心链路
+
+硬件接管链路：
+
+```text
+主界面开关
+  → MouseControlCoordinator
+  → HIDPPController.operationQueue
+  → Root Feature 0x0000 查询运行时 feature index
+  → 读取并保存 0x2121 / 0x2150 原模式
+  → 写入 Diverted 模式
+  → 再次读取并校验
+  → 发布已验证的 takeoverAxes
+```
+
+滚动事件链路：
+
+```text
+IOHID 原始报告
+  → HIDReportBridge 过滤 0x01/0x02
+  → HIDMonitor 保留报告边界和硬件时间戳
+  → HIDPPReportDecoder 解码 0x2121 / 0x2150
+  → ScrollDynamicsModel 展开 periods 并计算像素
+  → CGScrollInjector 注入带 marker 的连续像素事件
+```
+
+断开与恢复链路：
+
+```text
+Bluetooth IOHIDInterface 生命周期 / Receiver 0x10/0x41 链路通知
+  → 清除旧 transport 的槽位、feature index 和已验证轴
+  → 停止模式守护，不循环扫描
+  → 等待下一次硬件或输入事件
+  → 只执行一次重新发现、写入和回读
+```
+
+建议按以下顺序阅读代码：`MouseControlCoordinator` → `HIDMonitor` → `HIDPPProtocol` → `HIDPPController` → `ScrollDynamics` → `CGEventMonitor/Injector`。这样能先理解安全边界，再进入协议字节和并发细节。
 
 ## 当前边界与下一步
 
 当前已经完成 USB Receiver 与 Bluetooth 的真机控制链路验证；这不代表整个 Options+ 产品已被替代：
 
-- 主界面能实时显示 USB Receiver、Bluetooth 或未连接，并允许两种受支持的连接方式开启平滑滚动。
-- Bluetooth 已接入 `0xff43/0x0202` HID++ usage pair、`0xff` 直连索引和动态 feature 发现；为保持与 Receiver 一致的滚动时序，已从 parsed-element IOHIDQueue 切换为 raw-report callback，并在 C 层过滤复合设备的非 `0x11` 报告。
-- `0x2121` Diverted + High Resolution 配置、模式漂移恢复、断线重连、睡眠唤醒和原生恢复均已真机验证；SmartShift 尚未接管。
-- USB Receiver 与 Bluetooth 的断线重连、运行时 transport 选择、路由清理和重新接管均已完成真机验证。
+- 主界面根据 Bluetooth interface 生命周期和 Receiver 链路通知显示 USB Receiver、Bluetooth 或未连接；新设备到达会自动纳入监听。
+- Bluetooth 已接入 `0xff43/0x0202`、直连索引 `0xff` 和动态 feature 发现，并通过 C bridge 过滤复合接口中的普通指针报告。
+- `0x2121`/`0x2150` 接管、模式漂移恢复、睡眠唤醒、退出时原生恢复，以及两种传输的慢速和快速滚动手感均已真机验证。
+- 最新重连实现已经移除失败后的循环扫描并通过自动化测试；Bluetooth 到达和 Receiver `0x10/0x41` 通知触发单次恢复，仍需完成最后一轮断开/重连真机确认。
 - Live model 已支持显式全局输出，但当前仍以前台 App 形式运行，尚未产品化为登录项或菜单栏后台服务。
-- DPI、按键映射、手势等 Options+ 功能不在当前范围内。
+- SmartShift、DPI、按键映射和手势等 Options+ 功能不在当前范围内。
 
-下一步完成 Bluetooth raw-report 路径的最终低速手感和指针移动 CPU 验证，再继续菜单栏/登录启动、稳定开发签名和权限引导；设备能力方面后续处理 SmartShift。
+下一步先完成事件驱动重连的真机确认，再继续菜单栏/登录启动、稳定开发签名和权限引导；设备能力方面后续处理 SmartShift。

@@ -96,7 +96,7 @@ import Testing
     #expect(HIDPPProtocol.WheelMode(rawValue: 0x03).nativeTarget.rawValue == 0x02)
     #expect(HIDPPProtocol.WheelMode(rawValue: 0x07).nativeTarget.rawValue == 0x06)
     #expect(HIDPPProtocol.WheelMode(rawValue: 0x02).nativeTarget.rawValue == 0x02)
-    #expect(HIDPPProtocol.WheelMode(rawValue: 0x00).nativeTarget.rawValue == 0x02)
+    #expect(HIDPPProtocol.WheelMode(rawValue: 0x00).nativeTarget.rawValue == 0x00)
 }
 
 @Test func parsesThumbwheelStatusAndBuildsDivertedPayload() {

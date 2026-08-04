@@ -2,7 +2,9 @@ import Foundation
 import IOKit.hid
 
 enum HIDPPControllerError: LocalizedError, Equatable {
+    /// No IOHIDDevice control interface is currently published.
     case noHIDPPChannel
+    /// A Receiver exists, but none of slots 1...6 answered feature discovery.
     case deviceNotFound
     case featureUnsupported(UInt16)
     case writeFailed(IOReturn)
@@ -36,6 +38,44 @@ enum HIDPPControllerError: LocalizedError, Equatable {
     }
 }
 
+struct HIDPPTakeoverAxes: Equatable, Sendable {
+    /// True only after the corresponding device mode has been written and read
+    /// back successfully. Event suppression must never rely on intent alone.
+    var vertical = false
+    var horizontal = false
+
+    static let none = HIDPPTakeoverAxes()
+    var isEmpty: Bool { !vertical && !horizontal }
+}
+
+/// Thread-safe limiter for user/input-triggered verification.
+///
+/// A wall clock may jump after sleep or time synchronization. Hardware event
+/// throttling therefore uses the same monotonic time base as HID timestamps.
+final class MonotonicRateGate {
+    private let lock = NSLock()
+    private let intervalNanoseconds: UInt64
+    private var nextAllowedTimestampNs: UInt64 = 0
+
+    init(intervalNanoseconds: UInt64) {
+        self.intervalNanoseconds = intervalNanoseconds
+    }
+
+    func tryAcquire(timestampNs: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard timestampNs >= nextAllowedTimestampNs else { return false }
+        nextAllowedTimestampNs = timestampNs &+ intervalNanoseconds
+        return true
+    }
+
+    func reset() {
+        lock.lock()
+        nextAllowedTimestampNs = 0
+        lock.unlock()
+    }
+}
+
 /// Serializes every mutating HID++ operation performed against a Logitech
 /// Receiver or Bluetooth control channel and owns the safety lifecycle of
 /// diverted wheel modes.
@@ -44,7 +84,10 @@ enum HIDPPControllerError: LocalizedError, Equatable {
 /// - Feature indices are device-specific and must be discovered from Root
 ///   Feature `0x0000`; captured indices are never trusted for control writes.
 /// - Before the first write, the original main-wheel and thumbwheel modes are
-///   saved. Disable, failure and process termination restore those values.
+///   saved. Disable, recoverable failure and process termination restore those
+///   values while the channel is writable; physical disconnect invalidates the
+///   route and waits for event-driven reacquisition instead of pretending that
+///   an offline device was restored.
 /// - Every mode write is followed by a read-back. A successful transport write
 ///   only proves that bytes were accepted, not that the mouse applied them.
 /// - Requests are serialized because HID++ exposes only a 4-bit software ID
@@ -54,6 +97,9 @@ enum HIDPPControllerError: LocalizedError, Equatable {
 /// device/lifecycle state shared with IOKit callbacks, while `condition` pairs
 /// the synchronous request path with reports delivered by `HIDMonitor`.
 final class HIDPPController {
+    /// Observable controller phase. `channelReady` means an interface exists;
+    /// it does not prove that a paired Receiver device is awake. Only `ready`
+    /// follows successful feature discovery, mode writes and read-back.
     enum State: Equatable, Sendable, CustomStringConvertible {
         case unavailable
         case channelReady(HIDPPTransport)
@@ -79,51 +125,73 @@ final class HIDPPController {
     }
 
     var onStateChange: ((State) -> Void)?
+    var onTakeoverAxesChange: ((HIDPPTakeoverAxes) -> Void)?
     var onLog: ((String, String) -> Void)?
 
     private struct PendingRequest {
+        /// Exact route/function/tag expected in the reply. There can be only one
+        /// because HID++ provides a four-bit software ID rather than a full
+        /// transaction identifier.
         let header: HIDPPProtocol.RequestHeader
         var response: [UInt8]?
     }
 
     private struct ActiveWheel {
+        /// Addresses used by the current transport only; invalid after switch.
         let deviceIndex: UInt8
         let featureIndex: UInt8
+        /// Native-safe mode captured before the first mutating command.
         let restoreMode: HIDPPProtocol.WheelMode
     }
 
     private struct ActiveThumbwheel {
         let deviceIndex: UInt8
         let featureIndex: UInt8
+        /// Feature 0x2150 has a separate inversion bit that must be preserved.
         let restoreInverted: Bool
     }
 
     private struct Channel {
+        /// IOHIDDevice used by IOHIDDeviceSetReport for output commands.
         let device: IOHIDDevice
+        /// In-process identity shared with HIDMonitor callback routing.
         let key: UInt
         let transport: HIDPPTransport
     }
 
+    /// Serializes every hardware request, mode transaction and watchdog check.
     private let operationQueue = DispatchQueue(label: "dev.logi-mouse.hidpp-controller")
+    /// Pairs the synchronous SetReport request path with asynchronous 0x11 input.
     private let condition = NSCondition()
+    /// Protects routing and mode state touched by IOKit and operationQueue.
     private let stateLock = NSLock()
     private var channels: [UInt: Channel] = [:]
     private var selectedChannelKey: UInt?
     private var pendingRequest: PendingRequest?
+    /// Rotating non-zero four-bit tag embedded in the low nibble of byte 3.
     private var nextSoftwareID: UInt8 = 0x0a
+    /// Receiver slot seen in notifications/events; Bluetooth is always 0xff.
     private var observedDeviceIndex: UInt8?
+    /// Per-device runtime addresses returned by Root Feature discovery.
     private var featureIndices: [UInt8: UInt8] = [:]
     private var thumbwheelFeatureIndices: [UInt8: UInt8] = [:]
     private var activeWheel: ActiveWheel?
     private var activeThumbwheel: ActiveThumbwheel?
+    private var verifiedTakeoverAxes = HIDPPTakeoverAxes.none
     private var takeoverRequested = false
     private var modeWatchdog: DispatchSourceTimer?
     private var watchdogStableChecks = 0
     private var watchdogInterval: TimeInterval = 1
-    private var lastOnDemandVerificationNs: UInt64 = 0
+    private let onDemandVerificationGate = MonotonicRateGate(
+        intervalNanoseconds: 1_000_000_000
+    )
     private var reacquireAttemptScheduled = false
+
     // MARK: - HID++ channel lifecycle
 
+    /// Adds a physical control interface and selects the preferred transport.
+    /// Bluetooth wins while present because an inserted Receiver does not prove
+    /// its paired mouse is currently using that radio path.
     func considerDevice(
         _ device: IOHIDDevice,
         key: UInt,
@@ -141,6 +209,8 @@ final class HIDPPController {
         let shouldReacquire = takeoverRequested
         stateLock.unlock()
 
+        if channelChanged { publishTakeoverAxes(.none) }
+
         guard channelChanged, let selected else { return }
         cancelPendingRequest()
         operationQueue.async { [weak self] in self?.stopModeWatchdog() }
@@ -151,6 +221,9 @@ final class HIDPPController {
         }
     }
 
+    /// Removes a physical interface. If Bluetooth disappears while a Receiver
+    /// remains inserted, recovery waits for Receiver link/activity evidence
+    /// instead of immediately scanning dormant slots in a loop.
     func removeDevice(key: UInt) {
         stateLock.lock()
         let wasSelected = selectedChannelKey == key
@@ -164,6 +237,7 @@ final class HIDPPController {
         stateLock.unlock()
 
         if wasSelected {
+            publishTakeoverAxes(.none)
             operationQueue.async { [weak self] in
                 self?.stopModeWatchdog()
             }
@@ -187,6 +261,10 @@ final class HIDPPController {
         }
     }
 
+    /// Accepts every complete HID++ 0x11 input before event decoding.
+    ///
+    /// Exact replies wake `call`; unsolicited input also serves as proof that a
+    /// previously sleeping device is reachable and may trigger one reacquire.
     func observeReport(_ report: [UInt8]) {
         guard report.count == HIDPPProtocol.longReportLength,
               report.first == HIDPPProtocol.longReportID else { return }
@@ -208,6 +286,9 @@ final class HIDPPController {
         if shouldReacquire { scheduleReacquire(after: 0) }
     }
 
+    /// Handles Receiver radio-link changes. The USB dongle's IOHIDInterface
+    /// does not disappear when the mouse powers off, so report 0x10/0x41 is the
+    /// authoritative online/offline signal for Receiver mode.
     func observeReceiverConnection(
         deviceKey: UInt,
         event: HIDPPProtocol.ReceiverConnectionEvent
@@ -224,8 +305,11 @@ final class HIDPPController {
             activeThumbwheel = nil
             featureIndices.removeAll()
             thumbwheelFeatureIndices.removeAll()
+            verifiedTakeoverAxes = .none
         }
         stateLock.unlock()
+
+        if isSelectedReceiver, !event.isConnected { publishTakeoverAxes(.none) }
 
         guard isSelectedReceiver else { return }
         if event.isConnected {
@@ -254,16 +338,18 @@ final class HIDPPController {
         stateLock.unlock()
     }
 
+    /// Called when macOS emits an unexpected native scroll while takeover was
+    /// requested. This is useful hardware evidence that the device reset to
+    /// native mode after wake; the one-second gate prevents event storms.
     func verifyModeSoon() {
+        let now = MonotonicClock.nowNanoseconds()
+        guard onDemandVerificationGate.tryAcquire(timestampNs: now) else { return }
         operationQueue.async { [weak self] in
             guard let self, self.isTakeoverRequested else { return }
             guard self.hasActiveWheel else {
                 self.scheduleReacquire(after: 0)
                 return
             }
-            let now = MonotonicClock.nowNanoseconds()
-            guard now >= self.lastOnDemandVerificationNs + 1_000_000_000 else { return }
-            self.lastOnDemandVerificationNs = now
             self.verifyActiveMode()
         }
     }
@@ -288,6 +374,8 @@ final class HIDPPController {
 
     // MARK: - Public takeover lifecycle
 
+    /// Begins the all-axis hardware transaction on `operationQueue`.
+    /// Completion is delivered on the main queue for direct UI consumption.
     func takeOverWheel(completion: @escaping (Result<State, Error>) -> Void) {
         setTakeoverRequested(true)
         operationQueue.async { [weak self] in
@@ -307,6 +395,7 @@ final class HIDPPController {
                         self.log("hidpp_restore_after_takeover_failure_failed", error.localizedDescription)
                     }
                 }
+                self.invalidateVerifiedTakeoverAxes()
                 self.transition(to: .failed(error.localizedDescription))
                 self.log("hidpp_takeover_failed", error.localizedDescription)
                 DispatchQueue.main.async { completion(.failure(error)) }
@@ -322,6 +411,7 @@ final class HIDPPController {
                 let state = try self.performRestore()
                 DispatchQueue.main.async { completion(.success(state)) }
             } catch {
+                self.invalidateVerifiedTakeoverAxes()
                 self.transition(to: .failed(error.localizedDescription))
                 self.log("hidpp_restore_failed", error.localizedDescription)
                 DispatchQueue.main.async { completion(.failure(error)) }
@@ -329,6 +419,11 @@ final class HIDPPController {
         }
     }
 
+    /// Restores hardware before process termination.
+    ///
+    /// When called from the main thread, the run loop must keep pumping because
+    /// IOHIDManager delivers the restore replies there. A plain semaphore wait
+    /// would deadlock until timeout and could leave the wheel diverted.
     func restoreSynchronously() {
         setTakeoverRequested(false)
         if !Thread.isMainThread {
@@ -336,6 +431,7 @@ final class HIDPPController {
                 do {
                     _ = try performRestore()
                 } catch {
+                    invalidateVerifiedTakeoverAxes()
                     log("hidpp_restore_failed", error.localizedDescription)
                 }
             }
@@ -353,6 +449,7 @@ final class HIDPPController {
             do {
                 _ = try self.performRestore()
             } catch {
+                self.invalidateVerifiedTakeoverAxes()
                 self.log("hidpp_restore_failed", error.localizedDescription)
             }
         }
@@ -378,6 +475,9 @@ final class HIDPPController {
         featureIndices[deviceIndex] = feature.index
         stateLock.unlock()
 
+        // Transaction order is intentionally read -> save -> write -> read.
+        // SetReport success confirms only USB/BLE transport delivery, not that
+        // firmware accepted or persisted the requested mode.
         let originalMode = try getWheelMode(deviceIndex: deviceIndex, featureIndex: feature.index)
         let desiredMode = HIDPPProtocol.WheelMode.divertedHighResolution
 
@@ -416,10 +516,11 @@ final class HIDPPController {
                 actual: readBack.rawValue
             )
         }
+        setVerifiedTakeoverAxis(.vertical, enabled: true)
 
-
-        // The thumbwheel is a separate HID++ feature with separate reporting
-        // state. It cannot reuse the main wheel's feature index or mode bits.
+        // The thumbwheel is a separate physical sensor and HID++ feature with
+        // separate reporting state. It cannot reuse the main wheel's feature
+        // index or mode bits.
         let thumbwheelFeature = try discoverFeature(
             HIDPPProtocol.thumbwheelFeatureID,
             deviceIndex: deviceIndex,
@@ -458,6 +559,7 @@ final class HIDPPController {
                 actual: thumbwheelReadBack.reportingMode
             )
         }
+        setVerifiedTakeoverAxis(.horizontal, enabled: true)
 
         let ready = State.ready(
             deviceIndex: deviceIndex,
@@ -475,6 +577,9 @@ final class HIDPPController {
         return ready
     }
 
+    /// Restores both axes independently and reports the first failure only after
+    /// attempting both. Returning after one failed sensor would unnecessarily
+    /// strand the other sensor in diverted mode.
     private func performRestore() throws -> State {
         stopModeWatchdog()
         stateLock.lock()
@@ -482,6 +587,7 @@ final class HIDPPController {
         let activeThumbwheel = self.activeThumbwheel
         stateLock.unlock()
         guard activeWheel != nil || activeThumbwheel != nil else {
+            invalidateVerifiedTakeoverAxes()
             let transport = currentTransport()
             let newState: State = transport.map(State.channelReady) ?? .unavailable
             transition(to: newState)
@@ -515,7 +621,10 @@ final class HIDPPController {
                 }
                 stateLock.lock()
                 self.activeThumbwheel = nil
+                self.verifiedTakeoverAxes.horizontal = false
+                let axes = self.verifiedTakeoverAxes
                 stateLock.unlock()
+                publishTakeoverAxes(axes)
                 restoredDescriptions.append("thumbwheel={\(readBack)}")
             } catch {
                 firstError = error
@@ -546,7 +655,10 @@ final class HIDPPController {
                 }
                 stateLock.lock()
                 self.activeWheel = nil
+                self.verifiedTakeoverAxes.vertical = false
+                let axes = self.verifiedTakeoverAxes
                 stateLock.unlock()
+                publishTakeoverAxes(axes)
                 restoredDescriptions.append("wheel={\(readBack)}")
             } catch {
                 if firstError == nil { firstError = error }
@@ -573,9 +685,10 @@ final class HIDPPController {
         if let directIndex {
             return directIndex
         }
-        // Prefer the last observed slot for fast wake/reconnect recovery. Every
-        // sixth reacquire performs a full 1...6 scan so a slot change cannot
-        // permanently trap the controller on a stale route.
+        // Prefer a slot learned from Receiver 0x41 or an earlier wheel event.
+        // Event-driven reconnect normally has this route and avoids scanning.
+        // A user-initiated takeover may still scan 1...6 once when no route is
+        // known; failed recovery never schedules another scan by itself.
         var candidates: [UInt8] = []
         if let preferred { candidates.append(preferred) }
         if !knownRouteOnly || preferred == nil {
@@ -613,6 +726,8 @@ final class HIDPPController {
         deviceIndex: UInt8,
         timeout: TimeInterval
     ) throws -> HIDPPProtocol.FeatureInformation {
+        // Root function 0 accepts the stable 16-bit feature ID and returns the
+        // device-specific 8-bit index used by every subsequent call/event.
         let response = try call(
             deviceIndex: deviceIndex,
             featureIndex: UInt8(HIDPPProtocol.rootFeatureID),
@@ -641,6 +756,7 @@ final class HIDPPController {
         featureIndex: UInt8,
         quietly: Bool = false
     ) throws -> HIDPPProtocol.WheelMode {
+        // Feature 0x2121 function 1 reads the current mode bit field.
         let response = try call(
             deviceIndex: deviceIndex,
             featureIndex: featureIndex,
@@ -663,6 +779,8 @@ final class HIDPPController {
         deviceIndex: UInt8,
         featureIndex: UInt8
     ) throws -> HIDPPProtocol.WheelMode {
+        // Feature 0x2121 function 2 writes the mode. The response is parsed and
+        // the caller performs an additional GetMode read-back.
         let response = try call(
             deviceIndex: deviceIndex,
             featureIndex: featureIndex,
@@ -682,6 +800,7 @@ final class HIDPPController {
         featureIndex: UInt8,
         quietly: Bool = false
     ) throws -> HIDPPProtocol.ThumbwheelStatus {
+        // Feature 0x2150 function 1 returns reporting mode and inversion.
         let response = try call(
             deviceIndex: deviceIndex,
             featureIndex: featureIndex,
@@ -704,6 +823,9 @@ final class HIDPPController {
         deviceIndex: UInt8,
         featureIndex: UInt8
     ) throws {
+        // Feature 0x2150 function 2 changes reporting mode. Unlike 0x2121 it
+        // does not return the same compact mode value, so the transaction is
+        // verified by a separate GetStatus in the caller.
         _ = try call(
             deviceIndex: deviceIndex,
             featureIndex: featureIndex,
@@ -714,6 +836,9 @@ final class HIDPPController {
         log("hidpp_thumbwheel_status_written", status.description)
     }
 
+    /// Sends one HID++ long request and synchronously waits for its exact reply.
+    /// Must run on `operationQueue`; concurrent requests would overwrite the
+    /// single `pendingRequest` slot and make four-bit software tags ambiguous.
     private func call(
         deviceIndex: UInt8,
         featureIndex: UInt8,
@@ -810,6 +935,8 @@ final class HIDPPController {
     // MARK: - Drift watchdog and reconnect
 
     private func startModeWatchdog() {
+        // Firmware mode can be reset by sleep, reconnect or another Logitech
+        // process. Check quickly after takeover, then back off after stability.
         stopModeWatchdog()
         watchdogStableChecks = 0
         watchdogInterval = 1
@@ -823,6 +950,9 @@ final class HIDPPController {
         log("hidpp_mode_watchdog_started", "interval=1.0s adaptive=true")
     }
 
+    /// Schedules at most one recovery for one observed hardware/input event.
+    /// Failure intentionally does not recurse; the next BLE arrival, Receiver
+    /// 0x41 notification, HID++ report or native scroll event is required.
     private func scheduleReacquire(after delay: TimeInterval) {
         operationQueue.async { [weak self] in
             guard let self, !self.reacquireAttemptScheduled else { return }
@@ -861,6 +991,9 @@ final class HIDPPController {
         log("hidpp_mode_watchdog_interval", "interval=\(interval)s")
     }
 
+    /// Reads both physical sensor modes and repairs drift only after comparing
+    /// firmware state. Any missing response invalidates verified suppression
+    /// immediately and stops the timer to preserve idle CPU and radio battery.
     private func verifyActiveMode() {
         stateLock.lock()
         let activeWheel = self.activeWheel
@@ -959,7 +1092,9 @@ final class HIDPPController {
             self.activeThumbwheel = nil
             self.featureIndices.removeAll()
             self.thumbwheelFeatureIndices.removeAll()
+            self.verifiedTakeoverAxes = .none
             stateLock.unlock()
+            publishTakeoverAxes(.none)
             stopModeWatchdog()
             transition(to: .unavailable)
             log("hidpp_mode_watchdog_failed", error.localizedDescription)
@@ -1015,6 +1150,7 @@ final class HIDPPController {
         thumbwheelFeatureIndices.removeAll()
         activeWheel = nil
         activeThumbwheel = nil
+        verifiedTakeoverAxes = .none
     }
 
     private func cancelPendingRequest() {
@@ -1040,6 +1176,32 @@ final class HIDPPController {
         stateLock.lock()
         takeoverRequested = requested
         stateLock.unlock()
+        onDemandVerificationGate.reset()
+    }
+
+    private func setVerifiedTakeoverAxis(_ axis: ScrollAxis, enabled: Bool) {
+        stateLock.lock()
+        switch axis {
+        case .vertical: verifiedTakeoverAxes.vertical = enabled
+        case .horizontal: verifiedTakeoverAxes.horizontal = enabled
+        }
+        let axes = verifiedTakeoverAxes
+        stateLock.unlock()
+        publishTakeoverAxes(axes)
+    }
+
+    private func invalidateVerifiedTakeoverAxes() {
+        stateLock.lock()
+        let changed = !verifiedTakeoverAxes.isEmpty
+        verifiedTakeoverAxes = .none
+        stateLock.unlock()
+        if changed { publishTakeoverAxes(.none) }
+    }
+
+    private func publishTakeoverAxes(_ axes: HIDPPTakeoverAxes) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onTakeoverAxesChange?(axes)
+        }
     }
 
     private func takeSoftwareID() -> UInt8 {

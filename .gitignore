@@ -1,4 +1,5 @@
 /.build/
+/.swiftpm/
 /captures/*.jsonl
 *.app/
 .DS_Store

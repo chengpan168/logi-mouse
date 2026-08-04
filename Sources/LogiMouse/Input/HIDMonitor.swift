@@ -4,7 +4,10 @@ import IOKit.hid
 import os
 
 private final class HIDDeviceCallbackContext {
+    /// Weak to avoid a retain cycle: HIDMonitor owns the subscription, the
+    /// subscription owns this context, and IOHIDLib only borrows its pointer.
     weak var monitor: HIDMonitor?
+    /// Stable identity for one IOHIDDevice during its registered lifetime.
     let deviceKey: UInt
 
     init(monitor: HIDMonitor, deviceKey: UInt) {
@@ -13,9 +16,12 @@ private final class HIDDeviceCallbackContext {
     }
 }
 
-/// Entry point called by the C report filter. Pointer report 0x02 never reaches
+/// Swift ABI entry point called by the C report filter. Pointer report 0x02 never reaches
 /// this function; only HID++ 0x11 traffic and the Receiver's low-frequency
 /// device-connection notifications cross into Swift.
+///
+/// The raw buffer belongs to IOHIDLib and is valid only for this callback. It
+/// is copied before returning; retaining `report` would be a use-after-free.
 @_cdecl("LogiMouseReceiveHIDPPReport")
 func logiMouseReceiveHIDPPReport(
     _ context: UnsafeMutableRawPointer?,
@@ -59,23 +65,38 @@ enum HIDMonitorError: LocalizedError {
 /// - USB Receiver: `usagePage 0xff00`, `usage 1`
 /// - Bluetooth direct: `usagePage 0xff43`, `usage 0x0202`
 ///
-/// Bluetooth is one composite device, so its raw callback also receives pointer
-/// report 0x02. A tiny C bridge rejects those reports before entering Swift;
-/// only complete HID++ 0x11 reports reach the product path.
+/// USB and Bluetooth differ below this type:
+/// - Receiver PID 0xc52b publishes a dedicated vendor interface, so selecting
+///   usage page 0xff00 / usage 1 naturally excludes pointer movement.
+/// - Bluetooth publishes one composite device whose usage pairs include the
+///   vendor collection 0xff43/0x0202 alongside keyboard and pointer reports.
+///   IOHIDManager cannot reliably match only that nested pair, so the complete
+///   device is opened and the C bridge rejects report 0x01/0x02 immediately.
+///
+/// This type owns callback registration and report framing only. It never
+/// decides feature indices or mutates wheel modes; HIDPPController owns those
+/// hardware transactions and their restoration guarantees.
 final class HIDMonitor {
     var onWheelEvent: ((HIDPPWheelEvent, UInt64) -> Void)?
     var onThumbwheelEvent: ((HIDPPThumbwheelEvent, UInt64) -> Void)?
     var onControllerStateChange: ((HIDPPController.State) -> Void)?
+    var onTakeoverAxesChange: ((HIDPPTakeoverAxes) -> Void)?
 
+    /// USB vendor ID assigned to Logitech.
     private static let logitechVendorID = 0x046d
+    /// Product ID of the tested Unifying USB Receiver control interfaces.
     private static let unifyingReceiverProductID = 0xc52b
+    /// Logitech vendor usage pair that identifies HID++ inside the BLE descriptor.
     private static let bluetoothUsagePage = 0xff43
     private static let bluetoothUsage = 0x0202
     private static let logger = Logger(subsystem: "dev.logi-mouse", category: "hid-input")
 
     private final class RawReportSubscription {
+        /// Retaining IOHIDDevice keeps the callback target alive until unregister.
         let device: IOHIDDevice
+        /// Retains the object whose unowned pointer is passed through C.
         let context: HIDDeviceCallbackContext
+        /// IOHIDLib writes each report into this reusable allocation.
         let buffer: UnsafeMutablePointer<UInt8>
         let capacity: Int
 
@@ -94,6 +115,8 @@ final class HIDMonitor {
     }
 
     private struct PendingDevice {
+        /// A match can arrive synchronously from IOHIDManagerOpen; activation is
+        /// deferred until `managerIsOpen` so registration order is deterministic.
         let device: IOHIDDevice
         let transport: HIDPPTransport
     }
@@ -107,6 +130,9 @@ final class HIDMonitor {
     init() {
         controller.onStateChange = { [weak self] state in
             self?.onControllerStateChange?(state)
+        }
+        controller.onTakeoverAxesChange = { [weak self] axes in
+            self?.onTakeoverAxesChange?(axes)
         }
     }
 
@@ -123,6 +149,9 @@ final class HIDMonitor {
     }
 
     func start() throws {
+        // Listening to raw HID input is protected by macOS Input Monitoring.
+        // Requesting access is asynchronous: after the user changes the toggle,
+        // the process must be restarted before IOHIDManagerOpen can succeed.
         switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
         case kIOHIDAccessTypeGranted:
             break
@@ -135,6 +164,10 @@ final class HIDMonitor {
 
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         self.manager = manager
+        // USB can be matched to one dedicated collection. Bluetooth must be
+        // matched by VID/PID first and validated against DeviceUsagePairs in
+        // `deviceMatched`, because its primary usage is keyboard rather than
+        // the nested Logitech vendor collection we need.
         var matching: [[String: Int]] = [[
             kIOHIDVendorIDKey: Self.logitechVendorID,
             kIOHIDProductIDKey: Self.unifyingReceiverProductID,
@@ -170,6 +203,9 @@ final class HIDMonitor {
             },
             Unmanaged.passUnretained(self).toOpaque()
         )
+        // IOHIDManager callbacks are delivered on the main run loop. The raw
+        // report is timestamped in the kernel before this scheduling hop, so
+        // model timing uses the hardware timestamp rather than callback time.
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
         let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -183,6 +219,8 @@ final class HIDMonitor {
 
     func stop() {
         guard let manager else { return }
+        // Restore hardware before unregistering the report callback: restore
+        // requests need their 0x11 replies to wake HIDPPController.call().
         controller.restoreSynchronously()
         removeAllSubscriptions()
         managerIsOpen = false
@@ -205,6 +243,8 @@ final class HIDMonitor {
             reportID: reportID,
             bytes: reportBytes
         ) {
+            // The USB interface itself remains present while the paired mouse
+            // is off. Report 0x10/sub-ID 0x41 is the actual radio-link signal.
             controller.observeReceiverConnection(deviceKey: deviceKey, event: event)
             return
         }
@@ -261,6 +301,9 @@ final class HIDMonitor {
     }
 
     private func deviceMatched(_ device: IOHIDDevice) {
+        // Never identify the control channel by product name. Names are
+        // localized and shared across collections; VID/PID/usage/transport are
+        // stable descriptor properties suitable for hardware routing.
         let vendorID = Self.integerProperty(kIOHIDVendorIDKey, device: device)
         let productID = Self.integerProperty(kIOHIDProductIDKey, device: device)
         let usagePage = Self.integerProperty(kIOHIDPrimaryUsagePageKey, device: device)
@@ -305,15 +348,22 @@ final class HIDMonitor {
     }
 
     private func deviceRemoved(_ device: IOHIDDevice) {
+        // Remove the controller route before freeing the callback context so a
+        // concurrent late report cannot be accepted as the active transport.
         let key = Self.deviceKey(device)
         pendingDevices.removeValue(forKey: key)
         controller.removeDevice(key: key)
         removeSubscription(key: key)
     }
 
-    /// Both transports use the same lossless raw-report path. USB exposes only
-    /// HID++, while Bluetooth is composite; LMHIDPPFilteredReportCallback drops
-    /// its high-rate pointer reports in C before any Swift work occurs.
+    /// Installs one device-wide raw-report callback.
+    ///
+    /// The buffer must outlive callback registration, so it is stored inside
+    /// RawReportSubscription rather than allocated on the stack. Capacity is
+    /// at least one HID++ long report and otherwise follows the descriptor's
+    /// `MaxInputReportSize`. USB exposes only HID++, while Bluetooth is
+    /// composite; LMHIDPPFilteredReportCallback drops high-rate pointer reports
+    /// before any Swift allocation or locking occurs.
     private func installRawReportSubscription(device: IOHIDDevice, key: UInt) {
         guard reportSubscriptions[key] == nil else { return }
         let capacity = max(
@@ -339,6 +389,8 @@ final class HIDMonitor {
 
     private func removeSubscription(key: UInt) {
         if let subscription = reportSubscriptions.removeValue(forKey: key) {
+            // Unregister while both buffer and context are still retained by
+            // the local `subscription`; deallocation happens after this call.
             IOHIDDeviceRegisterInputReportWithTimeStampCallback(
                 subscription.device,
                 subscription.buffer,
@@ -354,6 +406,8 @@ final class HIDMonitor {
     }
 
     private static func deviceKey(_ device: IOHIDDevice) -> UInt {
+        // IOHIDDevice has no public Hashable identity. The CF object address is
+        // stable for its callback lifetime and is never persisted across runs.
         UInt(bitPattern: Unmanaged.passUnretained(device).toOpaque())
     }
 

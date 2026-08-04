@@ -34,6 +34,8 @@ enum MouseConnection: Equatable, Sendable {
 }
 
 struct HIDDeviceIdentity: Equatable, Sendable {
+    /// IORegistry identity is stable for one published service and lets a
+    /// termination notification remove exactly the entry that arrived.
     let registryID: UInt64
     let product: String
     let transport: String
@@ -44,6 +46,7 @@ struct HIDDeviceIdentity: Equatable, Sendable {
 }
 
 enum MouseConnectionResolver {
+    /// Logitech USB vendor ID and the tested Receiver product ID.
     static let logitechVendorID = 0x046d
     static let unifyingReceiverProductID = 0xc52b
     // MX Master 3, MX Master 3 for Mac and MX Master 3S Bluetooth identities.
@@ -85,6 +88,8 @@ enum MouseConnectionResolver {
 /// work before Input Monitoring permission is granted, and merely displaying a
 /// device must not subscribe to high-frequency pointer reports.
 final class DeviceConnectionMonitor {
+    /// IOHIDInterface follows the BLE link lifetime. Watching broader
+    /// IOHIDDevice classes left stale Bluetooth entries visible after power-off.
     private static let registryServiceClass = "IOHIDInterface"
 
     var onConnectionChange: ((MouseConnection) -> Void)?
@@ -100,6 +105,8 @@ final class DeviceConnectionMonitor {
               let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
         notificationPort = port
 
+        // IOKit delivers first-match and terminated iterators through this run
+        // loop source; callbacks do not open the device or receive input data.
         let source = IONotificationPortGetRunLoopSource(port).takeUnretainedValue()
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
 
@@ -157,6 +164,8 @@ final class DeviceConnectionMonitor {
     }
 
     private func consume(iterator: io_iterator_t, arrived: Bool) {
+        // Iterators are edge-triggered queues and must be drained completely.
+        // Leaving one service unread prevents reliable delivery of later edges.
         while true {
             let service = IOIteratorNext(iterator)
             guard service != 0 else { break }
@@ -184,6 +193,8 @@ final class DeviceConnectionMonitor {
     }
 
     private static func readDevice(_ service: io_service_t, registryID: UInt64) -> HIDDeviceIdentity? {
+        // Read descriptor properties only. Unlike HIDMonitor this path needs no
+        // Input Monitoring permission and cannot increase pointer-event CPU.
         guard let vendorID = integerProperty(kIOHIDVendorIDKey, service: service),
               vendorID == MouseConnectionResolver.logitechVendorID,
               let productID = integerProperty(kIOHIDProductIDKey, service: service) else {

@@ -195,6 +195,10 @@ final class MouseManagerWindowController: NSWindowController {
         }
         coordinator.onControllerStateChange = { [weak self] state in
             guard let self else { return }
+            // IORegistry presence and usable HID++ connectivity are different
+            // facts. A USB Receiver may remain in the registry after its mouse
+            // powers off, so runtime controller evidence may override the
+            // descriptor-only connection badge with `.disconnected`.
             switch state {
             case .unavailable, .failed:
                 self.runtimeConnectionUnavailable = true
