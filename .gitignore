@@ -1,0 +1,4 @@
+/.build/
+/captures/*.jsonl
+*.app/
+.DS_Store

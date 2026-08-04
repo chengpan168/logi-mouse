@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="700" viewBox="0 0 1000 700" role="img" aria-labelledby="title desc">
+  <title id="title">Options+ 滚动数据四联曲线分析</title>
+  <desc id="desc">四张曲线分别展示极慢滚动增益轨迹、瞬时速度的分叉、衰减活动量形成的 S 型关系，以及自然滚动下反向时 HID 与 CG 输出同步翻转。</desc>
+  <rect x="1" y="1" width="998" height="698" rx="12" fill="#ffffff" stroke="#d1d5db"/>
+  <text x="28" y="36" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="22" font-weight="600" fill="#111827">曲线探索：为何采用“衰减活动量 + 陡峭 S 型增益”</text>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, sans-serif" fill="#111827" font-size="16" font-weight="600">
+    <text x="38" y="75">极慢滚动：每段内部的增益轨迹</text>
+    <text x="528" y="75">仅用瞬时速度：同一速度仍有明显分叉</text>
+    <text x="38" y="377">30ms 衰减活动量：呈陡峭 S 形</text>
+    <text x="528" y="377">反向：自然滚动设置下符号同步翻转</text>
+  </g>
+
+  <!-- Panel 1: ultra-slow bursts. -->
+  <svg x="28" y="84" width="454" height="264" viewBox="0 0 420 250" aria-label="五次极慢滚动中增益随动作进度变化">
+    <g fill="none" stroke="#e5e7eb" stroke-width="1">
+      <path d="M48 208H406 M48 175H406 M48 109H406 M48 18.3H406"/>
+      <path d="M48 10V208H406" stroke="#374151"/>
+    </g>
+    <g fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">
+      <text x="40" y="211" text-anchor="end">0</text><text x="40" y="178" text-anchor="end">1</text><text x="40" y="112" text-anchor="end">3</text><text x="40" y="21" text-anchor="end">5.75</text>
+      <text x="48" y="226" text-anchor="middle">开始</text><text x="227" y="226" text-anchor="middle">中段</text><text x="406" y="226" text-anchor="middle">结束</text>
+      <text x="227" y="246" text-anchor="middle">单次动作归一化进度</text>
+      <text x="12" y="110" text-anchor="middle" transform="rotate(-90 12 110)">输出增益</text>
+    </g>
+    <g fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M65.9 181.6 L101.7 178.6 L137.5 180.6 L173.3 180.6 L209.1 179.0 L244.9 177.6 L280.7 179.9 L316.5 179.3 L352.3 181.6 L388.1 178.0" stroke="#60a5fa"/>
+      <path d="M65.9 181.9 L101.7 178.3 L137.5 179.0 L173.3 179.9 L209.1 178.3 L244.9 180.9 L280.7 178.3 L316.5 161.1 L352.3 179.9 L388.1 178.3" stroke="#a78bfa"/>
+      <path d="M65.9 183.3 L101.7 179.3 L137.5 150.6 L173.3 106.0 L209.1 102.4 L244.9 179.9 L280.7 175.0 L316.5 180.9 L352.3 175.0 L388.1 180.6" stroke="#34d399"/>
+      <path d="M65.9 181.3 L101.7 180.6 L137.5 143.3 L173.3 46.0 L209.1 90.5 L244.9 178.6 L280.7 178.6 L316.5 179.6 L352.3 179.6 L388.1 179.0" stroke="#f59e0b"/>
+      <path d="M65.9 182.6 L101.7 179.0 L137.5 115.9 L173.3 20.2 L209.1 36.4 L244.9 61.2 L280.7 84.9 L316.5 117.3 L352.3 178.0 L388.1 179.6" stroke="#2563eb" stroke-width="3"/>
+    </g>
+    <text x="205" y="50" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11" fill="#374151">极慢动作也会短暂进入高增益</text>
+  </svg>
+
+  <!-- Panel 2: instantaneous input rate. -->
+  <svg x="518" y="84" width="454" height="264" viewBox="0 0 420 250" aria-label="瞬时 HID 速度与每周期输出增益关系">
+    <g fill="none" stroke="#e5e7eb" stroke-width="1"><path d="M48 208H406 M48 175H406 M48 109H406 M48 18.3H406"/><path d="M48 10V208H406" stroke="#374151"/></g>
+    <path d="M64.3,26.5 L182.1,10 L203.4,10 L232.8,10 L253.8,10 L270,16.6 L283.2,15.6 L288.9,14.6 L295,14.6 L304.6,15.6 L313.3,16.6 L321.1,15.9 L334,15.6 L340.1,17.3 L348.9,16.6 L363.9,16.6 L378.8,16.6 L398.7,16.9 L398.7,18.3 L378.8,18.3 L363.9,18.6 L348.9,19.6 L340.1,18.3 L334,18.9 L321.1,19.9 L313.3,19.9 L304.6,18.3 L295,19.6 L288.9,20.9 L283.2,20.9 L270,20.9 L253.8,18.3 L232.8,20.9 L203.4,26.5 L182.1,175 L64.3,191.5 Z" fill="#fb923c" opacity="0.18"/>
+    <path d="M64.3,175 L182.1,20.9 L203.4,20.9 L232.8,20.9 L253.8,18.3 L270,16.6 L283.2,16.6 L288.9,18.3 L295,18.3 L304.6,18.3 L313.3,17.3 L321.1,16.6 L334,18.3 L340.1,17.6 L348.9,16.9 L363.9,17.9 L378.8,17.6 L398.7,17.6" fill="none" stroke="#2563eb" stroke-width="2.8" stroke-linejoin="round"/>
+    <g fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">
+      <text x="40" y="211" text-anchor="end">0</text><text x="40" y="178" text-anchor="end">1</text><text x="40" y="112" text-anchor="end">3</text><text x="40" y="21" text-anchor="end">5.75</text>
+      <text x="48" y="226" text-anchor="middle">30</text><text x="136" y="226" text-anchor="middle">100</text><text x="253" y="226" text-anchor="middle">500</text><text x="354" y="226" text-anchor="middle">2k</text><text x="406" y="226" text-anchor="middle">4k</text>
+      <text x="227" y="246" text-anchor="middle">|delta| · periods / 秒（对数轴）</text><text x="12" y="110" text-anchor="middle" transform="rotate(-90 12 110)">每周期增益</text>
+    </g>
+    <text x="65" y="157" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11" fill="#374151">低速区 10%–90% 跨越 0.5×–5.5×</text>
+  </svg>
+
+  <!-- Panel 3: leaky activity and exploratory Logistic fit. -->
+  <svg x="28" y="386" width="454" height="264" viewBox="0 0 420 250" aria-label="衰减活动量与输出增益及 Logistic 拟合曲线">
+    <g fill="none" stroke="#e5e7eb" stroke-width="1"><path d="M48 208H406 M48 175H406 M48 109H406 M48 18.3H406"/><path d="M48 10V208H406" stroke="#374151"/></g>
+    <path d="M83.1,43 L218,10 L256.3,10 L269.7,10 L282.4,10 L294.4,16.6 L304.1,15.6 L313.8,14.6 L320.7,14.6 L327,14.6 L334.2,16.6 L340.9,15.9 L346.8,15.9 L352.8,15.9 L360.6,16.6 L370.8,16.6 L386.6,16.6 L401.1,16.9 L401.1,18.3 L386.6,18.6 L370.8,18.9 L360.6,18.9 L352.8,18.3 L346.8,18.9 L340.9,19.9 L334.2,19.9 L327,18.3 L320.7,19.6 L313.8,20.9 L304.1,20.9 L294.4,20.9 L282.4,20.9 L269.7,20.9 L256.3,26.5 L218,175 L83.1,191.5 Z" fill="#fb923c" opacity="0.18"/>
+    <path d="M83.1,175 L218,20.9 L256.3,20.9 L269.7,20.9 L282.4,18.3 L294.4,18.3 L304.1,16.6 L313.8,16.6 L320.7,18.3 L327,18.3 L334.2,17.3 L340.9,17.3 L346.8,18.3 L352.8,17.6 L360.6,17.6 L370.8,17.6 L386.6,17.6 L401.1,17.6" fill="none" stroke="#2563eb" stroke-width="2.8" stroke-linejoin="round"/>
+    <path d="M48,174.9 L54,174.9 L59.9,174.9 L65.9,174.9 L71.9,174.9 L77.8,174.9 L83.8,174.8 L89.8,174.8 L95.7,174.8 L101.7,174.8 L107.7,174.7 L113.6,174.7 L119.6,174.6 L125.6,174.5 L131.5,174.4 L137.5,174.2 L143.5,174 L149.4,173.6 L155.4,173 L161.4,172.2 L167.3,170.7 L173.3,168.3 L179.3,164 L185.2,156.6 L191.2,143.8 L197.2,122.9 L203.1,93.9 L209.1,63 L215.1,39.5 L221,26.5 L227,21 L233,19 L238.9,18.4 L244.9,18.3 L406,18.3" fill="none" stroke="#16a34a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <g fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">
+      <text x="40" y="211" text-anchor="end">0</text><text x="40" y="178" text-anchor="end">1</text><text x="40" y="112" text-anchor="end">3</text><text x="40" y="21" text-anchor="end">5.75</text>
+      <text x="48" y="226" text-anchor="middle">.25</text><text x="131" y="226" text-anchor="middle">1</text><text x="202" y="226" text-anchor="middle">3.3</text><text x="268" y="226" text-anchor="middle">10</text><text x="406" y="226" text-anchor="middle">100</text>
+      <text x="227" y="246" text-anchor="middle">衰减活动量 A（对数轴）</text><text x="12" y="110" text-anchor="middle" transform="rotate(-90 12 110)">每周期增益</text>
+    </g>
+    <text x="104" y="145" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11" fill="#374151">历史量把分叉收束为陡峭 S 形</text>
+  </svg>
+
+  <!-- Panel 4: reverse direction. -->
+  <svg x="518" y="386" width="454" height="264" viewBox="0 0 420 250" aria-label="反向操作附近 HID 与 CG 输出的符号和幅值">
+    <g fill="none" stroke="#e5e7eb" stroke-width="1"><path d="M48 208H406 M48 143.4H406 M48 78.9H406 M48 57.4H406"/><path d="M48 10V208H406" stroke="#374151"/><path d="M207.1 10V208" stroke="#9ca3af" stroke-width="2"/></g>
+    <path d="M56,181.7 L66.6,117.4 L77.2,117.4 L87.8,117.4 L109,97.6 L207.1,43.1 L236.3,43.1 L257.5,38.2 L278.7,38.2 L299.9,38.2 L323.8,43.1 L345,43.1 L366.2,38.2 L376.8,38.2 L387.4,28.3 L398,23.3" fill="none" stroke="#fb923c" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M56,182.2 L66.6,117.6 L77.2,117.6 L87.8,117.6 L109,97.8 L207.1,48.7 L236.3,43.6 L257.5,38 L278.7,38.4 L299.9,37.5 L323.8,43.6 L345,42.7 L366.2,38.4 L376.8,38.4 L387.4,28.1 L398,22.9" fill="none" stroke="#2563eb" stroke-width="2.8" stroke-linejoin="round"/>
+    <g fill="#6b7280" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">
+      <text x="40" y="211" text-anchor="end">-180</text><text x="40" y="146" text-anchor="end">-75</text><text x="40" y="82" text-anchor="end">0</text><text x="40" y="60" text-anchor="end">25</text>
+      <text x="74.5" y="226" text-anchor="middle">-100</text><text x="207.1" y="226" text-anchor="middle">反向</text><text x="339.7" y="226" text-anchor="middle">+100</text>
+      <text x="227" y="246" text-anchor="middle">相对反向时刻（ms）</text><text x="12" y="110" text-anchor="middle" transform="rotate(-90 12 110)">带符号幅值</text>
+    </g>
+    <text x="168" y="101" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11" fill="#374151">HID 与 CG 同步过零，符号一致率 100%</text>
+  </svg>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" fill="#4b5563">
+    <line x1="35" y1="673" x2="65" y2="673" stroke="#2563eb" stroke-width="3"/><text x="73" y="677">中位数 / 实测 CG</text>
+    <rect x="205" y="666" width="30" height="12" fill="#fb923c" opacity="0.25"/><text x="243" y="677">10%–90% 区间</text>
+    <line x1="377" y1="673" x2="407" y2="673" stroke="#16a34a" stroke-width="3"/><text x="415" y="677">连续数学拟合</text>
+    <line x1="555" y1="673" x2="585" y2="673" stroke="#fb923c" stroke-width="3"/><text x="593" y="677">HID × 5.75</text>
+    <text x="720" y="677">自然滚动样本符号一致率：100%</text>
+  </g>
+</svg>
