@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <filter id="surface-shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#17201D" flood-opacity="0.14"/>
+    </filter>
+  </defs>
+
+  <rect
+    x="76"
+    y="76"
+    width="872"
+    height="872"
+    rx="202"
+    fill="#FFFFFF"
+    stroke="#DCE4E1"
+    stroke-width="8"
+    filter="url(#surface-shadow)"
+  />
+
+  <path
+    d="M512 210C397 210 328 293 328 414V610C328 741 398 814 512 814C626 814 696 741 696 610V414C696 293 627 210 512 210Z"
+    fill="none"
+    stroke="#27312E"
+    stroke-width="34"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <path
+    d="M512 228V382"
+    fill="none"
+    stroke="#27312E"
+    stroke-width="24"
+    stroke-linecap="round"
+  />
+
+  <rect x="482" y="276" width="60" height="126" rx="30" fill="#55CFA7"/>
+</svg>
