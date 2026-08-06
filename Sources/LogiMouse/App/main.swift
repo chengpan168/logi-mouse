@@ -29,12 +29,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        // Closing the settings window must not stop HID monitoring. logi-mouse
+        // is a background input service whose window is only its control panel;
+        // the process and current smooth-scrolling mode remain active until the
+        // user explicitly quits the application.
+        false
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        if !flag {
+            managerWindow?.showWindow(nil)
+            sender.activate(ignoringOtherApps: true)
+        }
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         // This is the last safety boundary for hardware mode restoration.
-        // Command-Q, menu Quit and normal window termination all converge here.
+        // Command-Q and the application menu's Quit command converge here;
+        // closing the control window intentionally does not stop the service.
         managerWindow?.prepareForTermination()
     }
 }

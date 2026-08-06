@@ -358,11 +358,6 @@ final class MouseManagerWindowController: NSWindowController {
         if let window { alert.beginSheetModal(for: window) } else { alert.runModal() }
     }
 
-    override func close() {
-        prepareForTermination()
-        super.close()
-    }
-
     func prepareForTermination() {
         connectionMonitor.stop()
         coordinator.stop()
