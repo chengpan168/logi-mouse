@@ -48,32 +48,10 @@ struct HIDPPTakeoverAxes: Equatable, Sendable {
     var isEmpty: Bool { !vertical && !horizontal }
 }
 
-/// Thread-safe limiter for user/input-triggered verification.
-///
-/// A wall clock may jump after sleep or time synchronization. Hardware event
-/// throttling therefore uses the same monotonic time base as HID timestamps.
-final class MonotonicRateGate {
-    private let lock = NSLock()
-    private let intervalNanoseconds: UInt64
-    private var nextAllowedTimestampNs: UInt64 = 0
-
-    init(intervalNanoseconds: UInt64) {
-        self.intervalNanoseconds = intervalNanoseconds
-    }
-
-    func tryAcquire(timestampNs: UInt64) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard timestampNs >= nextAllowedTimestampNs else { return false }
-        nextAllowedTimestampNs = timestampNs &+ intervalNanoseconds
-        return true
-    }
-
-    func reset() {
-        lock.lock()
-        nextAllowedTimestampNs = 0
-        lock.unlock()
-    }
+enum HIDPPBatteryState: Equatable, Sendable {
+    case unavailable
+    case loading
+    case available(HIDPPProtocol.BatteryInfo)
 }
 
 /// Serializes every mutating HID++ operation performed against a Logitech
@@ -93,9 +71,10 @@ final class MonotonicRateGate {
 /// - Requests are serialized because HID++ exposes only a 4-bit software ID
 ///   for response matching and unsolicited events use the same input channel.
 ///
-/// `operationQueue` performs commands and watchdog work. `stateLock` protects
-/// device/lifecycle state shared with IOKit callbacks, while `condition` pairs
-/// the synchronous request path with reports delivered by `HIDMonitor`.
+/// `operationQueue` performs commands and event-triggered verification work.
+/// `stateLock` protects device/lifecycle state shared with IOKit callbacks,
+/// while `condition` pairs the synchronous request path with reports delivered
+/// by `HIDMonitor`.
 final class HIDPPController {
     /// Observable controller phase. `channelReady` means an interface exists;
     /// it does not prove that a paired Receiver device is awake. Only `ready`
@@ -126,6 +105,7 @@ final class HIDPPController {
 
     var onStateChange: ((State) -> Void)?
     var onTakeoverAxesChange: ((HIDPPTakeoverAxes) -> Void)?
+    var onBatteryStateChange: ((HIDPPBatteryState) -> Void)?
     var onLog: ((String, String) -> Void)?
 
     private struct PendingRequest {
@@ -159,7 +139,7 @@ final class HIDPPController {
         let transport: HIDPPTransport
     }
 
-    /// Serializes every hardware request, mode transaction and watchdog check.
+    /// Serializes hardware requests, mode transactions and explicit verification.
     private let operationQueue = DispatchQueue(label: "dev.logi-mouse.hidpp-controller")
     /// Pairs the synchronous SetReport request path with asynchronous 0x11 input.
     private let condition = NSCondition()
@@ -175,17 +155,14 @@ final class HIDPPController {
     /// Per-device runtime addresses returned by Root Feature discovery.
     private var featureIndices: [UInt8: UInt8] = [:]
     private var thumbwheelFeatureIndices: [UInt8: UInt8] = [:]
+    private var batteryFeatures: [UInt8: HIDPPProtocol.BatteryFeature] = [:]
     private var activeWheel: ActiveWheel?
     private var activeThumbwheel: ActiveThumbwheel?
     private var verifiedTakeoverAxes = HIDPPTakeoverAxes.none
     private var takeoverRequested = false
-    private var modeWatchdog: DispatchSourceTimer?
-    private var watchdogStableChecks = 0
-    private var watchdogInterval: TimeInterval = 1
-    private let onDemandVerificationGate = MonotonicRateGate(
-        intervalNanoseconds: 1_000_000_000
-    )
     private var reacquireAttemptScheduled = false
+    private var batteryRefreshScheduled = false
+    private var routeGeneration: UInt64 = 0
 
     // MARK: - HID++ channel lifecycle
 
@@ -213,9 +190,9 @@ final class HIDPPController {
 
         guard channelChanged, let selected else { return }
         cancelPendingRequest()
-        operationQueue.async { [weak self] in self?.stopModeWatchdog() }
         transition(to: .channelReady(selected.transport))
         log("hidpp_controller_device", "selected \(selected.transport) HID++ channel")
+        refreshBattery(after: 0.15)
         if shouldReacquire {
             scheduleReacquire(after: 0.15)
         }
@@ -238,13 +215,14 @@ final class HIDPPController {
 
         if wasSelected {
             publishTakeoverAxes(.none)
-            operationQueue.async { [weak self] in
-                self?.stopModeWatchdog()
-            }
+            publishBatteryState(.unavailable)
             cancelPendingRequest()
             if let replacement {
                 transition(to: .channelReady(replacement.transport))
                 log("hidpp_controller_device", "fell back to \(replacement.transport) HID++ channel")
+                if replacement.transport == .bluetooth {
+                    refreshBattery(after: 0.15)
+                }
                 // A Receiver interface remains present even when its paired
                 // mouse is offline. Do not scan its slots merely because a
                 // Bluetooth channel disappeared; wait for the Receiver's
@@ -261,29 +239,33 @@ final class HIDPPController {
         }
     }
 
-    /// Accepts every complete HID++ 0x11 input before event decoding.
-    ///
-    /// Exact replies wake `call`; unsolicited input also serves as proof that a
-    /// previously sleeping device is reachable and may trigger one reacquire.
+    /// Accepts every complete HID++ 0x11 input before event decoding. Exact
+    /// replies wake `call`; ordinary wheel reports never trigger verification.
     func observeReport(_ report: [UInt8]) {
         guard report.count == HIDPPProtocol.longReportLength,
               report.first == HIDPPProtocol.longReportID else { return }
 
+        var matchedPendingRequest = false
         condition.lock()
         if let pendingRequest,
            HIDPPProtocol.matchesResponse(report, request: pendingRequest.header) {
             self.pendingRequest?.response = report
+            matchedPendingRequest = true
             condition.broadcast()
         }
         condition.unlock()
 
-        // A report from a previously unavailable mouse is itself connection
-        // evidence. One event starts one recovery transaction; failures remain
-        // idle until another hardware/input event arrives.
+        guard !matchedPendingRequest, report[3] == 0 else { return }
         stateLock.lock()
-        let shouldReacquire = takeoverRequested && activeWheel == nil
+        let batteryFeature = batteryFeatures[report[1]]
         stateLock.unlock()
-        if shouldReacquire { scheduleReacquire(after: 0) }
+        guard batteryFeature?.index == report[2],
+              let batteryFeature,
+              let battery = HIDPPProtocol.batteryInfo(
+                  in: report,
+                  feature: batteryFeature
+              ) else { return }
+        publishBatteryState(.available(battery))
     }
 
     /// Handles Receiver radio-link changes. The USB dongle's IOHIDInterface
@@ -305,7 +287,9 @@ final class HIDPPController {
             activeThumbwheel = nil
             featureIndices.removeAll()
             thumbwheelFeatureIndices.removeAll()
+            batteryFeatures.removeAll()
             verifiedTakeoverAxes = .none
+            routeGeneration &+= 1
         }
         stateLock.unlock()
 
@@ -315,9 +299,16 @@ final class HIDPPController {
         if event.isConnected {
             log("hidpp_receiver_connected", "slot=\(event.deviceIndex)")
             transition(to: .channelReady(.usbReceiver))
-            if shouldReacquire { scheduleReacquire(after: 0.05) }
+            refreshBattery(after: 0.05)
+            if shouldReacquire {
+                if hasActiveWheel {
+                    verifyMode()
+                } else {
+                    scheduleReacquire(after: 0.05)
+                }
+            }
         } else {
-            operationQueue.async { [weak self] in self?.stopModeWatchdog() }
+            publishBatteryState(.unavailable)
             cancelPendingRequest()
             transition(to: .unavailable)
             log("hidpp_receiver_disconnected", "slot=\(event.deviceIndex)")
@@ -338,12 +329,9 @@ final class HIDPPController {
         stateLock.unlock()
     }
 
-    /// Called when macOS emits an unexpected native scroll while takeover was
-    /// requested. This is useful hardware evidence that the device reset to
-    /// native mode after wake; the one-second gate prevents event storms.
-    func verifyModeSoon() {
-        let now = MonotonicClock.nowNanoseconds()
-        guard onDemandVerificationGate.tryAcquire(timestampNs: now) else { return }
+    /// Performs one read-back requested by a low-frequency lifecycle event,
+    /// such as reopening the control window. Scroll traffic never calls this.
+    func verifyMode() {
         operationQueue.async { [weak self] in
             guard let self, self.isTakeoverRequested else { return }
             guard self.hasActiveWheel else {
@@ -352,6 +340,12 @@ final class HIDPPController {
             }
             self.verifyActiveMode()
         }
+    }
+
+    /// Reads battery state after an explicit UI request. Device lifecycle
+    /// events call the same path with a short stabilization delay.
+    func refreshBattery() {
+        refreshBattery(after: 0)
     }
 
     func featureIndex(for deviceIndex: UInt8) -> UInt8? {
@@ -567,7 +561,6 @@ final class HIDPPController {
             mode: readBack
         )
         transition(to: ready)
-        startModeWatchdog()
         log(
             "hidpp_takeover_ready",
             "wheel_feature_version=\(feature.version) original={\(originalMode)} applied={\(readBack)} "
@@ -581,7 +574,6 @@ final class HIDPPController {
     /// attempting both. Returning after one failed sensor would unnecessarily
     /// strand the other sensor in diverted mode.
     private func performRestore() throws -> State {
-        stopModeWatchdog()
         stateLock.lock()
         let activeWheel = self.activeWheel
         let activeThumbwheel = self.activeThumbwheel
@@ -749,6 +741,111 @@ final class HIDPPController {
             )
         )
         return information
+    }
+
+    // MARK: - Battery
+
+    private func refreshBattery(after delay: TimeInterval) {
+        stateLock.lock()
+        guard selectedChannelLocked() != nil else {
+            stateLock.unlock()
+            publishBatteryState(.unavailable)
+            return
+        }
+        guard !batteryRefreshScheduled else {
+            stateLock.unlock()
+            return
+        }
+        batteryRefreshScheduled = true
+        let generation = routeGeneration
+        stateLock.unlock()
+
+        publishBatteryState(.loading)
+        operationQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            let result: Result<HIDPPProtocol.BatteryInfo, Error>
+            do {
+                result = .success(try self.readBattery())
+            } catch {
+                result = .failure(error)
+            }
+
+            self.stateLock.lock()
+            self.batteryRefreshScheduled = false
+            let currentGeneration = self.routeGeneration
+            let hasChannel = self.selectedChannelLocked() != nil
+            self.stateLock.unlock()
+
+            guard generation == currentGeneration else {
+                if hasChannel { self.refreshBattery(after: 0.15) }
+                return
+            }
+
+            switch result {
+            case let .success(battery):
+                self.publishBatteryState(.available(battery))
+                self.log(
+                    "hidpp_battery_read",
+                    "level=\(battery.percentage.map(String.init) ?? "approximate") "
+                        + "state=\(battery.chargingState)"
+                )
+            case let .failure(error):
+                self.publishBatteryState(.unavailable)
+                self.log("hidpp_battery_read_failed", error.localizedDescription)
+            }
+        }
+    }
+
+    private func readBattery() throws -> HIDPPProtocol.BatteryInfo {
+        let deviceIndex = try discoverDeviceIndex(knownRouteOnly: false)
+        stateLock.lock()
+        let cachedFeature = batteryFeatures[deviceIndex]
+        stateLock.unlock()
+
+        let feature: HIDPPProtocol.BatteryFeature
+        if let cachedFeature {
+            feature = cachedFeature
+        } else {
+            feature = try discoverBatteryFeature(deviceIndex: deviceIndex)
+            stateLock.lock()
+            batteryFeatures[deviceIndex] = feature
+            stateLock.unlock()
+        }
+
+        let response = try call(
+            deviceIndex: deviceIndex,
+            featureIndex: feature.index,
+            functionID: feature.statusFunctionID,
+            payload: [0, 0, 0],
+            timeout: 0.7
+        )
+        guard let battery = HIDPPProtocol.batteryInfo(
+            in: response,
+            feature: feature
+        ) else {
+            throw HIDPPControllerError.unexpectedResponse
+        }
+        return battery
+    }
+
+    private func discoverBatteryFeature(
+        deviceIndex: UInt8
+    ) throws -> HIDPPProtocol.BatteryFeature {
+        do {
+            let feature = try discoverFeature(
+                HIDPPProtocol.unifiedBatteryFeatureID,
+                deviceIndex: deviceIndex,
+                timeout: 0.7
+            )
+            return .unified(index: feature.index)
+        } catch HIDPPControllerError.featureUnsupported {
+            let feature = try discoverFeature(
+                HIDPPProtocol.batteryStatusFeatureID,
+                deviceIndex: deviceIndex,
+                timeout: 0.7
+            )
+            return .legacy(index: feature.index)
+        }
     }
 
     private func getWheelMode(
@@ -932,27 +1029,11 @@ final class HIDPPController {
         return response
     }
 
-    // MARK: - Drift watchdog and reconnect
+    // MARK: - Event-driven verification and reconnect
 
-    private func startModeWatchdog() {
-        // Firmware mode can be reset by sleep, reconnect or another Logitech
-        // process. Check quickly after takeover, then back off after stability.
-        stopModeWatchdog()
-        watchdogStableChecks = 0
-        watchdogInterval = 1
-        let timer = DispatchSource.makeTimerSource(queue: operationQueue)
-        timer.schedule(deadline: .now() + 0.5, repeating: 1.0, leeway: .milliseconds(100))
-        timer.setEventHandler { [weak self] in
-            self?.verifyActiveMode()
-        }
-        modeWatchdog = timer
-        timer.resume()
-        log("hidpp_mode_watchdog_started", "interval=1.0s adaptive=true")
-    }
-
-    /// Schedules at most one recovery for one observed hardware/input event.
-    /// Failure intentionally does not recurse; the next BLE arrival, Receiver
-    /// 0x41 notification, HID++ report or native scroll event is required.
+    /// Schedules at most one recovery for one device lifecycle event. Failure
+    /// intentionally does not recurse; the next BLE arrival, Receiver 0x41
+    /// notification or explicit window-open verification is required.
     private func scheduleReacquire(after delay: TimeInterval) {
         operationQueue.async { [weak self] in
             guard let self, !self.reacquireAttemptScheduled else { return }
@@ -976,33 +1057,15 @@ final class HIDPPController {
         }
     }
 
-    private func stopModeWatchdog() {
-        modeWatchdog?.cancel()
-        modeWatchdog = nil
-        watchdogStableChecks = 0
-        watchdogInterval = 1
-    }
-
-    private func setWatchdogInterval(_ interval: TimeInterval) {
-        guard watchdogInterval != interval, let modeWatchdog else { return }
-        watchdogInterval = interval
-        let leeway: DispatchTimeInterval = interval <= 1 ? .milliseconds(100) : .seconds(2)
-        modeWatchdog.schedule(deadline: .now() + interval, repeating: interval, leeway: leeway)
-        log("hidpp_mode_watchdog_interval", "interval=\(interval)s")
-    }
-
     /// Reads both physical sensor modes and repairs drift only after comparing
     /// firmware state. Any missing response invalidates verified suppression
-    /// immediately and stops the timer to preserve idle CPU and radio battery.
+    /// immediately; a later device event or window open may trigger recovery.
     private func verifyActiveMode() {
         stateLock.lock()
         let activeWheel = self.activeWheel
         let activeThumbwheel = self.activeThumbwheel
         stateLock.unlock()
-        guard let activeWheel else {
-            stopModeWatchdog()
-            return
-        }
+        guard let activeWheel else { return }
 
         let desiredMode = HIDPPProtocol.WheelMode.divertedHighResolution
         do {
@@ -1011,9 +1074,7 @@ final class HIDPPController {
                 featureIndex: activeWheel.featureIndex,
                 quietly: true
             )
-            var repairedDrift = false
             if observed != desiredMode {
-                repairedDrift = true
                 log(
                     "hidpp_mode_drift_detected",
                     "observed={\(observed)} expected={\(desiredMode)}"
@@ -1048,7 +1109,6 @@ final class HIDPPController {
                     quietly: true
                 )
                 if thumbwheelObserved != .diverted {
-                    repairedDrift = true
                     log(
                         "hidpp_thumbwheel_mode_drift_detected",
                         "observed={\(thumbwheelObserved)} expected={\(HIDPPProtocol.ThumbwheelStatus.diverted)}"
@@ -1071,22 +1131,10 @@ final class HIDPPController {
                     log("hidpp_thumbwheel_mode_reasserted", thumbwheelReadBack.description)
                 }
             }
-            // Check quickly during initial takeover and after repair. Once eight
-            // consecutive checks are stable, reduce polling to preserve idle
-            // CPU and mouse battery/radio activity.
-            if repairedDrift {
-                watchdogStableChecks = 0
-                setWatchdogInterval(1)
-            } else {
-                watchdogStableChecks += 1
-                if watchdogStableChecks >= 8 {
-                    setWatchdogInterval(15)
-                }
-            }
         } catch {
             // A missing response means the active mouse is gone or asleep.
-            // Stop polling completely. Bluetooth arrival, Receiver 0x41, a
-            // HID++ report, or a native scroll event will trigger one recovery.
+            // Bluetooth arrival, Receiver 0x41 or reopening the control window
+            // will trigger one recovery attempt.
             stateLock.lock()
             self.activeWheel = nil
             self.activeThumbwheel = nil
@@ -1095,9 +1143,8 @@ final class HIDPPController {
             self.verifiedTakeoverAxes = .none
             stateLock.unlock()
             publishTakeoverAxes(.none)
-            stopModeWatchdog()
             transition(to: .unavailable)
-            log("hidpp_mode_watchdog_failed", error.localizedDescription)
+            log("hidpp_mode_verification_failed", error.localizedDescription)
         }
     }
 
@@ -1148,9 +1195,11 @@ final class HIDPPController {
         observedDeviceIndex = transport?.directDeviceIndex
         featureIndices.removeAll()
         thumbwheelFeatureIndices.removeAll()
+        batteryFeatures.removeAll()
         activeWheel = nil
         activeThumbwheel = nil
         verifiedTakeoverAxes = .none
+        routeGeneration &+= 1
     }
 
     private func cancelPendingRequest() {
@@ -1176,7 +1225,6 @@ final class HIDPPController {
         stateLock.lock()
         takeoverRequested = requested
         stateLock.unlock()
-        onDemandVerificationGate.reset()
     }
 
     private func setVerifiedTakeoverAxis(_ axis: ScrollAxis, enabled: Bool) {
@@ -1201,6 +1249,12 @@ final class HIDPPController {
     private func publishTakeoverAxes(_ axes: HIDPPTakeoverAxes) {
         DispatchQueue.main.async { [weak self] in
             self?.onTakeoverAxesChange?(axes)
+        }
+    }
+
+    private func publishBatteryState(_ state: HIDPPBatteryState) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onBatteryStateChange?(state)
         }
     }
 

@@ -42,7 +42,7 @@ open .build/logi-mouse.app
 | 指针事件 | 选中的 HID++ interface 不接收指针报告 | 同一 raw callback 会收到 `0x02` 指针和 `0x11` HID++ 报告 |
 | CPU 表现 | 移动指针不会唤醒 logi-mouse | 系统会先唤醒回调；C bridge 在进入 Swift 前丢弃 `0x02`，只能降低成本，不能消除底层唤醒 |
 | 连接事件 | Receiver 保持插入；通过 `0x10/0x41` 通知判断配对设备上线/离线 | 通过 `IOHIDInterface` 到达和终止判断连接 |
-| 重连方式 | 收到 Receiver 连接通知、HID++ 活动或原生滚动后恢复一次 | Bluetooth interface 重新出现后恢复一次 |
+| 重连方式 | 收到 Receiver 连接通知后恢复一次 | Bluetooth interface 重新出现后恢复一次 |
 
 Bluetooth 慢速滚动曾因 parsed-element `IOHIDQueue` 合并和调度时序出现停顿。最终两种传输都改用保留原始边界和时间戳的 raw-report callback，并按 `periods` 展开，因此超慢和快速滚动已经使用同一条数据路径。Bluetooth 的复合接口决定了指针移动仍会唤醒进程；评估过 HIDDriverKit，但它同样需要接管整个复合 interface，还会引入系统驱动竞争和发布 entitlement，当前不采用。
 
@@ -66,13 +66,13 @@ Bluetooth 慢速滚动曾因 parsed-element `IOHIDQueue` 合并和调度时序�
 | 横向滚轮失效或不跟手 | 初期只接管 `0x2121`，横向轮仍走不同的系统路径 | 增加 `0x2150` 动态发现和 Diverted 模式；复用主滚轮算法但使用独立轴状态 |
 | 测试区可能混入 Options+ 输出 | 模型输出与 Options+ 原始事件同时存在 | 使用同轴、时间窗口和 period 配额抑制原始事件；注入事件加 marker 防止反馈环 |
 | `Command-Q` 不能退出或退出后滚轮异常 | 退出路径没有先同步恢复硬件模式 | 标准菜单和终止流程统一执行同步恢复，再结束进程 |
-| 静止时 CPU 仍约 `0.5%` | 高频队列、固定轮询和调试链路持续唤醒 | 下线采集入口，改 raw-report callback；守护稳定后降频，失联后完全停止轮询 |
+| 静止时 CPU 仍约 `0.5%` | 高频队列、固定轮询和调试链路持续唤醒 | 下线采集入口，改 raw-report callback；模式校验改为窗口显示或设备连接事件触发 |
 | 蓝牙快速滚动慢且卡顿 | Bluetooth 报告可能批量携带多个 `periods`，旧路径丢失时序 | 使用 raw report 并逐 period 展开，现与 USB 使用同一模型 |
 | 蓝牙超慢滚动“停一下、滚一下” | parsed-element queue 不保留原始报告边界，Run Loop 调度放大低速间隔 | 放弃 IOHIDQueue，USB/Bluetooth 统一使用 raw-report callback |
 | 蓝牙移动指针时 CPU 高于 USB | Bluetooth 把指针 `0x02` 和 HID++ `0x11` 放在同一复合 interface | C 层在 Swift 前过滤指针报告；这是 Apple HID 拓扑带来的剩余差异 |
 | 报错 `No HID++ device responded...` | 传输切换后仍使用旧槽位/feature，或 Bluetooth 匹配方式不正确 | 切换时清理路由；Receiver 重新扫描槽位，Bluetooth 使用 `0xff` 并重新发现 feature |
 | 鼠标断开后主界面仍显示连接 | 只根据泛化设备或已插入 Receiver 判断，未跟踪真实接口和链路 | Bluetooth 跟踪 `IOHIDInterface` 生命周期；Receiver 解析 `0x10/0x41` 链路通知 |
-| 鼠标断开后不断重试扫描 | 接管意图保留后，失败路径每 `0.35 s` 递归重试 | 改为事件驱动；一次事件只恢复一次，失败后等待下一次硬件或输入事件 |
+| 鼠标断开后不断重试扫描 | 接管意图保留后，失败路径每 `0.35 s` 递归重试 | 改为事件驱动；一次事件只恢复一次，失败后等待下一次设备连接事件或窗口重新显示 |
 
 ## 数据链路
 
@@ -234,7 +234,7 @@ CGEvent 面向所有应用都可靠的 point delta 是整数位移。若每次�
 
 在 Options+ Agent 停止状态下完成了以下真机闭环：
 
-- Agent 退出会把设备从 Diverted `0x03` 改回原生 `0x02`；1 秒守护检测到漂移后自动写回并回读 `0x03`，无需人工切换接管开关。
+- 曾验证 Agent 退出会把设备从 Diverted `0x03` 改回原生 `0x02`，重新写入并回读 `0x03` 可以恢复。当前不做周期守护，窗口重新显示或设备重连时才校验。
 - Agent 停止后，HID++ `0x2121` 输入、模型输出和应用注入持续工作，测试区滚动体验正常，外部 Options+ 事件为零。
 - 取消接管时，应用写入并回读 `0x02`，原生系统滚动正常。
 - 接管状态下按 `Command-Q`，应用在退出前写入并回读 `0x02`；进程退出后、Options+ Agent 未参与时，原生滚动正常。
@@ -408,8 +408,8 @@ IOHID 原始报告
 ```text
 Bluetooth IOHIDInterface 生命周期 / Receiver 0x10/0x41 链路通知
   → 清除旧 transport 的槽位、feature index 和已验证轴
-  → 停止模式守护，不循环扫描
-  → 等待下一次硬件或输入事件
+  → 不启动模式守护，不循环扫描
+  → 等待下一次设备连接事件或窗口重新显示
   → 只执行一次重新发现、写入和回读
 ```
 

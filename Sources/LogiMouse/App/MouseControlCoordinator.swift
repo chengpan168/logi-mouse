@@ -21,6 +21,7 @@ final class MouseControlCoordinator {
 
     var onStatusChange: ((String) -> Void)?
     var onControllerStateChange: ((HIDPPController.State) -> Void)?
+    var onBatteryStateChange: ((HIDPPBatteryState) -> Void)?
 
     private var hidMonitor: HIDMonitor?
     private var eventMonitor: CGEventMonitor?
@@ -73,6 +74,9 @@ final class MouseControlCoordinator {
                 self.targetScrollCorrelation.reset(.horizontal)
             }
         }
+        hidMonitor.onBatteryStateChange = { [weak self] state in
+            self?.onBatteryStateChange?(state)
+        }
         eventMonitor.shouldSuppressVerticalScroll = { [weak self] in
             guard let self else { return false }
             // Both conditions are required: verified takeover establishes
@@ -92,11 +96,6 @@ final class MouseControlCoordinator {
                     timestampNs: MonotonicClock.nowNanoseconds()
                 )
         }
-        eventMonitor.onExternalScrollEvent = { [weak self] in
-            guard let self, self.isTakeoverEnabled else { return }
-            self.hidMonitor?.verifyWheelModeSoon()
-        }
-
         do {
             try hidMonitor.start()
             try eventMonitor.start()
@@ -158,6 +157,18 @@ final class MouseControlCoordinator {
     func setDirection(_ direction: ScrollDirectionMapping) {
         verticalModel.setDirectionMapping(direction)
         horizontalModel.setDirectionMapping(direction)
+    }
+
+    /// Performs one explicit hardware read-back when the control window opens.
+    /// Normal scroll traffic never enters this path.
+    func verifyTakeoverMode() {
+        guard isRunning, isTakeoverEnabled else { return }
+        hidMonitor?.verifyWheelMode()
+    }
+
+    func refreshBattery() {
+        guard isRunning else { return }
+        hidMonitor?.refreshBattery()
     }
 
     func setGlobalOutputEnabled(_ enabled: Bool) {

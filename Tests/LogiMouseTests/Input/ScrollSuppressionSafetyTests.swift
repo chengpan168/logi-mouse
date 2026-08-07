@@ -29,18 +29,6 @@ import Testing
     #expect(!correlation.consumeMatch(.horizontal, timestampNs: 110))
 }
 
-@Test func onDemandVerificationGateCoalescesBeforeQueueing() {
-    let gate = MonotonicRateGate(intervalNanoseconds: 1_000)
-
-    #expect(gate.tryAcquire(timestampNs: 10_000))
-    #expect(!gate.tryAcquire(timestampNs: 10_001))
-    #expect(!gate.tryAcquire(timestampNs: 10_999))
-    #expect(gate.tryAcquire(timestampNs: 11_000))
-
-    gate.reset()
-    #expect(gate.tryAcquire(timestampNs: 1))
-}
-
 @Test func takeoverAxesAreIndependent() {
     var axes = HIDPPTakeoverAxes(vertical: true, horizontal: true)
     axes.vertical = false

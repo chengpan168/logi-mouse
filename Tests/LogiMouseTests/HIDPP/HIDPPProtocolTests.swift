@@ -113,6 +113,84 @@ import Testing
     ] == [1, 0, 0])
 }
 
+@Test func batteryFeaturesUseTheirProtocolSpecificStatusFunctions() {
+    let unified = HIDPPProtocol.BatteryFeature.unified(index: 0x12)
+    let legacy = HIDPPProtocol.BatteryFeature.legacy(index: 0x13)
+
+    #expect(unified.index == 0x12)
+    #expect(unified.statusFunctionID == 1)
+    #expect(legacy.index == 0x13)
+    #expect(legacy.statusFunctionID == 0)
+}
+
+@Test func parsesBatteryPercentageAndChargingState() {
+    var discharging = [UInt8](repeating: 0, count: 20)
+    discharging[0...6] = [0x11, 0x01, 0x12, 0x1a, 0x54, 0x32, 0x00]
+    #expect(HIDPPProtocol.batteryInfo(
+        in: discharging,
+        feature: .unified(index: 0x12)
+    ) == .init(
+        percentage: 84,
+        approximateLevel: nil,
+        chargingState: .discharging
+    ))
+
+    var charging = discharging
+    charging[4] = 42
+    charging[6] = 1
+    #expect(HIDPPProtocol.batteryInfo(
+        in: charging,
+        feature: .unified(index: 0x12)
+    ) == .init(
+        percentage: 42,
+        approximateLevel: nil,
+        chargingState: .charging
+    ))
+
+    var full = discharging
+    full[4] = 100
+    full[6] = 3
+    #expect(HIDPPProtocol.batteryInfo(
+        in: full,
+        feature: .legacy(index: 0x13)
+    ) == .init(
+        percentage: 100,
+        approximateLevel: nil,
+        chargingState: .full
+    ))
+}
+
+@Test func unifiedBatteryFallsBackToAnApproximateLevel() {
+    var response = [UInt8](repeating: 0, count: 20)
+    response[0...6] = [0x11, 0x01, 0x12, 0x1a, 0x00, 0x02, 0x00]
+
+    #expect(HIDPPProtocol.batteryInfo(
+        in: response,
+        feature: .unified(index: 0x12)
+    ) == .init(
+        percentage: nil,
+        approximateLevel: .low,
+        chargingState: .discharging
+    ))
+}
+
+@Test func rejectsInvalidBatteryResponses() {
+    var invalidPercentage = [UInt8](repeating: 0, count: 20)
+    invalidPercentage[0...6] = [0x11, 0x01, 0x12, 0x1a, 0xff, 0x00, 0x00]
+    #expect(HIDPPProtocol.batteryInfo(
+        in: invalidPercentage,
+        feature: .unified(index: 0x12)
+    ) == nil)
+
+    var deviceError = invalidPercentage
+    deviceError[2] = 0xff
+    deviceError[4] = 50
+    #expect(HIDPPProtocol.batteryInfo(
+        in: deviceError,
+        feature: .legacy(index: 0x13)
+    ) == nil)
+}
+
 @Test func decoderUsesDiscoveredFeatureAndRejectsCommandResponses() {
     let notification: [UInt8] = [0x11, 0x02, 0x17, 0x00, 0x11, 0x00, 0x04]
     #expect(

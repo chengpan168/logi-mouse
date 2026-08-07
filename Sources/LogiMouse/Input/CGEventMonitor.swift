@@ -135,7 +135,6 @@ enum CGEventMonitorError: LocalizedError {
 final class CGEventMonitor {
     var shouldSuppressVerticalScroll: (() -> Bool)?
     var shouldSuppressHorizontalScroll: (() -> Bool)?
-    var onExternalScrollEvent: (() -> Void)?
 
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
@@ -165,7 +164,6 @@ final class CGEventMonitor {
                 let injected = event.getIntegerValueField(.eventSourceUserData)
                     == CGScrollInjector.eventMarker
                 if injected { return Unmanaged.passUnretained(event) }
-                monitor.onExternalScrollEvent?()
 
                 let vertical = CGScrollAxisClassifier.isPrimarilyVertical(event)
                 let shouldSuppress = vertical

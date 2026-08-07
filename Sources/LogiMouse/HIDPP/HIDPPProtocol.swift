@@ -62,6 +62,10 @@ enum HIDPPProtocol {
     static let hiResWheelFeatureID: UInt16 = 0x2121
     /// Horizontal thumbwheel: raw rotation and reporting-mode control.
     static let thumbwheelFeatureID: UInt16 = 0x2150
+    /// Newer devices expose percentage and charging state through this feature.
+    static let unifiedBatteryFeatureID: UInt16 = 0x1001
+    /// Older HID++ 2.0 battery feature used when Unified Battery is absent.
+    static let batteryStatusFeatureID: UInt16 = 0x1000
 
     static func isLongInputReport(_ reportID: UInt32) -> Bool {
         reportID == UInt32(longReportID)
@@ -165,6 +169,56 @@ enum HIDPPProtocol {
         static let diverted = ThumbwheelStatus(reportingMode: 1, directionInverted: false)
     }
 
+    enum BatteryFeature: Equatable, Sendable {
+        case unified(index: UInt8)
+        case legacy(index: UInt8)
+
+        var index: UInt8 {
+            switch self {
+            case let .unified(index), let .legacy(index): index
+            }
+        }
+
+        var statusFunctionID: UInt8 {
+            switch self {
+            case .unified: 1
+            case .legacy: 0
+            }
+        }
+    }
+
+    struct BatteryInfo: Equatable, Sendable {
+        enum ApproximateLevel: Equatable, Sendable {
+            case empty
+            case critical
+            case low
+            case good
+            case full
+
+            var representativePercentage: Int {
+                switch self {
+                case .empty: 0
+                case .critical: 5
+                case .low: 20
+                case .good: 50
+                case .full: 90
+                }
+            }
+        }
+
+        enum ChargingState: Equatable, Sendable {
+            case discharging
+            case charging
+            case full
+            case error
+            case unknown
+        }
+
+        let percentage: Int?
+        let approximateLevel: ApproximateLevel?
+        let chargingState: ChargingState
+    }
+
     static func makeLongRequest(header: RequestHeader, payload: [UInt8]) -> [UInt8] {
         precondition(header.functionID < 16)
         precondition(header.softwareID > 0 && header.softwareID < 16)
@@ -225,6 +279,42 @@ enum HIDPPProtocol {
         return ThumbwheelStatus(
             reportingMode: report[4],
             directionInverted: report[5] & 0x01 != 0
+        )
+    }
+
+    /// Both Battery Status 0x1000 and Unified Battery 0x1001 status payloads
+    /// begin with percentage, next reported threshold and battery status.
+    static func batteryInfo(
+        in report: [UInt8],
+        feature: BatteryFeature
+    ) -> BatteryInfo? {
+        guard report.count == longReportLength,
+              report[2] != 0xff,
+              report[4] <= 100 else { return nil }
+
+        let chargingState: BatteryInfo.ChargingState = switch report[6] {
+        case 0: .discharging
+        case 1, 2, 4: .charging
+        case 3: .full
+        case 5, 6: .error
+        default: .unknown
+        }
+        let percentage = report[4] == 0 ? nil : Int(report[4])
+        let approximateLevel: BatteryInfo.ApproximateLevel? = switch feature {
+        case .legacy: nil
+        case .unified:
+            switch report[5] {
+            case 8: .full
+            case 4: .good
+            case 2: .low
+            case 1: .critical
+            default: .empty
+            }
+        }
+        return BatteryInfo(
+            percentage: percentage,
+            approximateLevel: percentage == nil ? approximateLevel : nil,
+            chargingState: chargingState
         )
     }
 }

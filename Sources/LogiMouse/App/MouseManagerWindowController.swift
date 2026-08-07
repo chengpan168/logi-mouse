@@ -12,6 +12,9 @@ final class MouseManagerWindowController: NSWindowController {
     private let deviceIcon = NSImageView()
     private let deviceNameLabel = NSTextField(labelWithString: "未检测到设备")
     private let transportLabel = NSTextField(labelWithString: "未连接")
+    private let batteryIcon = NSImageView()
+    private let batteryLabel = NSTextField(labelWithString: "电量不可用")
+    private let batteryView = NSStackView()
     private let smoothScrollingSwitch = NSSwitch()
     private let directionControl = NSSegmentedControl(
         labels: ["自然滚动", "标准滚动"],
@@ -25,6 +28,7 @@ final class MouseManagerWindowController: NSWindowController {
     private var detectedConnection: MouseConnection = .disconnected
     private var runtimeConnectionUnavailable = false
     private var smoothTransitionInProgress = false
+    private var batteryState = HIDPPBatteryState.unavailable
 
     init() {
         let window = NSWindow(
@@ -43,6 +47,12 @@ final class MouseManagerWindowController: NSWindowController {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        coordinator.verifyTakeoverMode()
+        coordinator.refreshBattery()
     }
 
     func startAutomatically() {
@@ -107,7 +117,16 @@ final class MouseManagerWindowController: NSWindowController {
         labels.alignment = .leading
         labels.spacing = 3
 
-        let row = NSStackView(views: [deviceIcon, labels])
+        batteryIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .regular)
+        batteryIcon.contentTintColor = .secondaryLabelColor
+        batteryLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        batteryLabel.textColor = .secondaryLabelColor
+        batteryView.setViews([batteryIcon, batteryLabel], in: .leading)
+        batteryView.orientation = .horizontal
+        batteryView.alignment = .centerY
+        batteryView.spacing = 6
+
+        let row = NSStackView(views: [deviceIcon, labels, NSView(), batteryView])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 14
@@ -222,6 +241,10 @@ final class MouseManagerWindowController: NSWindowController {
                 break
             }
         }
+        coordinator.onBatteryStateChange = { [weak self] state in
+            self?.batteryState = state
+            self?.updateBatteryUI()
+        }
     }
 
     @objc private func toggleSmoothScrolling(_ sender: NSSwitch) {
@@ -325,10 +348,97 @@ final class MouseManagerWindowController: NSWindowController {
         case .usbReceiver: deviceIcon.contentTintColor = .systemGreen
         case .bluetooth: deviceIcon.contentTintColor = .systemBlue
         }
+        updateBatteryUI()
+    }
+
+    private func updateBatteryUI() {
+        guard connection != .disconnected else {
+            batteryView.isHidden = true
+            return
+        }
+        batteryView.isHidden = false
+
+        switch batteryState {
+        case .unavailable:
+            batteryIcon.image = NSImage(
+                systemSymbolName: "battery.0percent",
+                accessibilityDescription: "电量不可用"
+            )
+            batteryIcon.contentTintColor = .tertiaryLabelColor
+            batteryLabel.stringValue = "电量不可用"
+            batteryLabel.textColor = .secondaryLabelColor
+        case .loading:
+            batteryIcon.image = NSImage(
+                systemSymbolName: "battery.100percent",
+                accessibilityDescription: "正在读取电量"
+            )
+            batteryIcon.contentTintColor = .tertiaryLabelColor
+            batteryLabel.stringValue = "读取中…"
+            batteryLabel.textColor = .secondaryLabelColor
+        case let .available(battery):
+            let displayLevel = battery.percentage
+                ?? battery.approximateLevel?.representativePercentage
+            batteryIcon.image = NSImage(
+                systemSymbolName: batterySymbolName(for: displayLevel),
+                accessibilityDescription: batteryDescription(battery)
+            )
+            batteryLabel.stringValue = batteryDescription(battery)
+            let color: NSColor
+            switch battery.chargingState {
+            case .charging, .full: color = .systemGreen
+            case .error: color = .systemRed
+            case .discharging, .unknown:
+                if let displayLevel {
+                    color = displayLevel <= 20 ? .systemRed
+                        : displayLevel <= 40 ? .systemOrange
+                        : .secondaryLabelColor
+                } else {
+                    color = .secondaryLabelColor
+                }
+            }
+            batteryIcon.contentTintColor = color
+            batteryLabel.textColor = color
+        }
+    }
+
+    private func batterySymbolName(for percentage: Int?) -> String {
+        guard let percentage else { return "battery.0percent" }
+        return switch percentage {
+        case 76...: "battery.100percent"
+        case 51...: "battery.75percent"
+        case 26...: "battery.50percent"
+        case 1...: "battery.25percent"
+        default: "battery.0percent"
+        }
+    }
+
+    private func batteryDescription(_ battery: HIDPPProtocol.BatteryInfo) -> String {
+        let level: String
+        if let percentage = battery.percentage {
+            level = "\(percentage)%"
+        } else {
+            level = switch battery.approximateLevel {
+            case .empty: "电量耗尽"
+            case .critical: "电量危急"
+            case .low: "电量较低"
+            case .good: "电量良好"
+            case .full: "电量充足"
+            case nil: "电量未知"
+            }
+        }
+        return switch battery.chargingState {
+        case .charging: "\(level) · 充电中"
+        case .full: "\(level) · 已充满"
+        case .error: "\(level) · 状态异常"
+        case .discharging, .unknown: level
+        }
     }
 
     private func applyConnection(_ connection: MouseConnection) {
         self.connection = connection
+        if connection == .disconnected {
+            batteryState = .unavailable
+        }
         updateConnectionUI(connection)
         updateSmoothControlAvailability()
     }

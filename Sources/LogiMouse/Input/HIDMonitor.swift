@@ -81,6 +81,7 @@ final class HIDMonitor {
     var onThumbwheelEvent: ((HIDPPThumbwheelEvent, UInt64) -> Void)?
     var onControllerStateChange: ((HIDPPController.State) -> Void)?
     var onTakeoverAxesChange: ((HIDPPTakeoverAxes) -> Void)?
+    var onBatteryStateChange: ((HIDPPBatteryState) -> Void)?
 
     /// USB vendor ID assigned to Logitech.
     private static let logitechVendorID = 0x046d
@@ -134,6 +135,9 @@ final class HIDMonitor {
         controller.onTakeoverAxesChange = { [weak self] axes in
             self?.onTakeoverAxesChange?(axes)
         }
+        controller.onBatteryStateChange = { [weak self] state in
+            self?.onBatteryStateChange?(state)
+        }
     }
 
     func takeOverWheel(completion: @escaping (Result<HIDPPController.State, Error>) -> Void) {
@@ -144,8 +148,12 @@ final class HIDMonitor {
         controller.restoreWheel(completion: completion)
     }
 
-    func verifyWheelModeSoon() {
-        controller.verifyModeSoon()
+    func verifyWheelMode() {
+        controller.verifyMode()
+    }
+
+    func refreshBattery() {
+        controller.refreshBattery()
     }
 
     func start() throws {
