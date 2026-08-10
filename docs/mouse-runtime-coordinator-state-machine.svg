@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="4105" height="1995" viewBox="0 0 4105 1995">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<defs><marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#374151"/></marker></defs>
+<g transform="translate(-20 15)">
+<rect x="1510" y="35" width="650" height="180" rx="8" stroke="#1e293b" stroke-width="2" fill="#1e293b"/>
+<ellipse cx="175" cy="325" rx="95" ry="50" stroke="#1e40af" stroke-width="2" fill="#dbeafe" stroke-dasharray="10 8"/>
+<polyline points="275,325 380,325" fill="none" stroke="#1e40af" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="385" y="265" width="230" height="120" rx="8" stroke="#c2410c" stroke-width="2" fill="#fed7aa"/>
+<polyline points="620,325 725,325" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#arrow)"/>
+<ellipse cx="830" cy="325" rx="100" ry="50" stroke="#047857" stroke-width="3" fill="#a7f3d0"/>
+<polyline points="935,325 1035,325" fill="none" stroke="#047857" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="1040" y="255" width="270" height="140" rx="8" stroke="#dc2626" stroke-width="2" fill="#fee2e2"/>
+<polyline points="1315,325 1405,325" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="10 8" marker-end="url(#arrow)"/>
+<ellipse cx="1510" cy="325" rx="100" ry="50" stroke="#1e40af" stroke-width="2" fill="#dbeafe" stroke-dasharray="10 8"/>
+<polyline points="1615,325 1710,325" fill="none" stroke="#1e40af" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="1715" y="255" width="270" height="140" rx="8" stroke="#b45309" stroke-width="2" fill="#fef3c7"/>
+<polyline points="1850,400 1850,470 830,470 830,380" fill="none" stroke="#b45309" stroke-width="2" stroke-dasharray="10 8" marker-end="url(#arrow)"/>
+<polyline points="830,270 830,215 2050,215 2050,305" fill="none" stroke="#b91c1c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="2020" y="255" width="210" height="140" rx="8" stroke="#b91c1c" stroke-width="2" fill="#fecaca"/>
+<polyline points="2125,400 2125,490 175,490 175,380" fill="none" stroke="#b91c1c" stroke-width="2" marker-end="url(#arrow)"/>
+<polyline points="70,550 2230,550" fill="none" stroke="#93c5fd" stroke-width="1" stroke-dasharray="10 8"/>
+<ellipse cx="190" cy="755" rx="110" ry="55" stroke="#1e40af" stroke-width="2" fill="#dbeafe" stroke-dasharray="10 8"/>
+<polyline points="305,755 420,755" fill="none" stroke="#1e40af" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="425" y="685" width="260" height="140" rx="8" stroke="#1e3a5f" stroke-width="2" fill="#93c5fd"/>
+<polyline points="690,755 800,755" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="805" y="685" width="270" height="140" rx="8" stroke="#1e3a5f" stroke-width="2" fill="#60a5fa"/>
+<polyline points="1080,755 1185,755" fill="none" stroke="#1e3a5f" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="1190" y="675" width="300" height="160" rx="8" stroke="#1e3a5f" stroke-width="2" fill="#3b82f6"/>
+<polyline points="1495,755 1605,755" fill="none" stroke="#1e3a5f" stroke-width="3" marker-end="url(#arrow)"/>
+<ellipse cx="1750" cy="755" rx="140" ry="70" stroke="#047857" stroke-width="3" fill="#a7f3d0"/>
+<rect x="1600" y="930" width="300" height="145" rx="8" stroke="#b45309" stroke-width="2" fill="#fef3c7"/>
+<polyline points="1750,830 1750,925" fill="none" stroke="#047857" stroke-width="2" marker-end="url(#arrow)"/>
+<polyline points="1810,925 1870,880 1870,825" fill="none" stroke="#b45309" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="1970" y="685" width="260" height="140" rx="8" stroke="#6d28d9" stroke-width="2" fill="#ddd6fe"/>
+<polyline points="1895,755 1965,755" fill="none" stroke="#047857" stroke-width="2" marker-end="url(#arrow)"/>
+<polyline points="2100,830 2100,900 555,900 555,825" fill="none" stroke="#6d28d9" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="1130" y="980" width="310" height="155" rx="8" stroke="#b91c1c" stroke-width="2" fill="#fecaca"/>
+<polyline points="1340,840 1340,975" fill="none" stroke="#b91c1c" stroke-width="2" marker-end="url(#arrow)"/>
+<polyline points="1595,1000 1445,1055" fill="none" stroke="#b91c1c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="650" y="980" width="310" height="155" rx="8" stroke="#1e40af" stroke-width="2" fill="#dbeafe" stroke-dasharray="10 8"/>
+<polyline points="1125,1040 1055,1040 1055,830 945,830" fill="none" stroke="#b45309" stroke-width="2" stroke-dasharray="10 8" marker-end="url(#arrow)"/>
+<polyline points="1125,1090 965,1090" fill="none" stroke="#b91c1c" stroke-width="2" marker-end="url(#arrow)"/>
+<polyline points="650,1055 555,1055 555,830" fill="none" stroke="#1e40af" stroke-width="2" stroke-dasharray="10 8" marker-end="url(#arrow)"/>
+<polyline points="1750,680 1750,635 190,635 190,695" fill="none" stroke="#dc2626" stroke-width="2" marker-end="url(#arrow)"/>
+<polyline points="1890,720 1935,720 1935,640 1875,640" fill="none" stroke="#047857" stroke-width="2" stroke-dasharray="10 8" marker-end="url(#arrow)"/>
+<polyline points="1640,835 1640,915 555,915 555,830" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="10 8" marker-end="url(#arrow)"/>
+<polyline points="500,390 500,435 175,435 175,380" fill="none" stroke="#b91c1c" stroke-width="2" stroke-dasharray="10 8" marker-end="url(#arrow)"/>
+<polyline points="1990,320 2065,320 2065,225 1915,225" fill="none" stroke="#b45309" stroke-width="2" stroke-dasharray="10 8" marker-end="url(#arrow)"/>
+<polyline points="70,1190 2230,1190" fill="none" stroke="#93c5fd" stroke-width="1" stroke-dasharray="10 8"/>
+<ellipse cx="215" cy="1375" rx="115" ry="55" stroke="#1e40af" stroke-width="2" fill="#dbeafe" stroke-dasharray="10 8"/>
+<polyline points="335,1355 515,1355" fill="none" stroke="#1e40af" stroke-width="2" marker-end="url(#arrow)"/>
+<ellipse cx="645" cy="1375" rx="125" ry="55" stroke="#047857" stroke-width="2" fill="#a7f3d0"/>
+<polyline points="520,1400 335,1400" fill="none" stroke="#047857" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="880" y="1300" width="570" height="230" rx="8" stroke="#1e293b" stroke-width="2" fill="#1e293b"/>
+<rect x="1540" y="1300" width="650" height="230" rx="8" stroke="#dc2626" stroke-width="2" fill="#fee2e2"/>
+<polyline points="70,1590 2230,1590" fill="none" stroke="#93c5fd" stroke-width="1" stroke-dasharray="10 8"/>
+<rect x="90" y="1685" width="2100" height="245" rx="8" stroke="#047857" stroke-width="2" fill="#a7f3d0"/>
+<text x="70" y="72" text-anchor="start" fill="#1e40af" font-family="Menlo, PingFang SC, monospace" font-size="32"><tspan x="70" dy="0">MouseRuntimeCoordinator 完整状态流转图</tspan></text>
+<text x="72" y="110" text-anchor="start" fill="#64748b" font-family="Menlo, PingFang SC, monospace" font-size="18"><tspan x="72" dy="0">唯一协调器管理两个正交状态机：外层系统生命周期 + 内层设备会话；用户意图和 generation 是状态数据，不伪装成设备阶段</tspan></text>
+<text x="1540" y="75" text-anchor="start" fill="#22c55e" font-family="Menlo, PingFang SC, monospace" font-size="17"><tspan x="1540" dy="0">struct MouseRuntimeState {</tspan><tspan x="1540" dy="21.25">  lifecycle: LifecycleState</tspan><tspan x="1540" dy="21.25">  device: DeviceState</tspan><tspan x="1540" dy="21.25">  takeoverRequested: Bool</tspan><tspan x="1540" dy="21.25">  verifiedAxes: HIDPPTakeoverAxes</tspan><tspan x="1540" dy="21.25">  generation: UInt64</tspan><tspan x="1540" dy="21.25">}</tspan></text>
+<text x="70" y="205" text-anchor="start" fill="#1e40af" font-family="Menlo, PingFang SC, monospace" font-size="25"><tspan x="70" dy="0">1. 外层 LifecycleState：系统生命周期闭环</tspan></text>
+<text x="175" y="320.5" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="18"><tspan x="175" dy="0">STOPPED</tspan><tspan x="175" dy="22.5">无监听资源</tspan></text>
+<text x="335" y="296" text-anchor="middle" fill="#64748b" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="335" dy="0">applicationDidFinishLaunching</tspan></text>
+<text x="500" y="299.5" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="17"><tspan x="500" dy="0">STARTING</tspan><tspan x="500" dy="21.25">generation++</tspan><tspan x="500" dy="21.25">创建 3 个监听器</tspan><tspan x="500" dy="21.25">device = absent</tspan></text>
+<text x="675" y="304" text-anchor="middle" fill="#047857" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="675" dy="0">监听创建成功</tspan></text>
+<text x="830" y="320.5" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="18"><tspan x="830" dy="0">RUNNING</tspan><tspan x="830" dy="22.5">设备状态机工作</tspan></text>
+<text x="987.5" y="299" text-anchor="middle" fill="#dc2626" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="987.5" dy="0">systemWillSleep</tspan></text>
+<text x="1175" y="291" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="1175" dy="0">SUSPENDING</tspan><tspan x="1175" dy="20">verifiedAxes = none</tspan><tspan x="1175" dy="20">取消请求/重试</tspan><tspan x="1175" dy="20">释放 HID，不同步恢复</tspan><tspan x="1175" dy="20">device = absent</tspan></text>
+<text x="1510" y="320.5" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="18"><tspan x="1510" dy="0">SUSPENDED</tspan><tspan x="1510" dy="22.5">只保留用户配置</tspan></text>
+<text x="1662.5" y="299" text-anchor="middle" fill="#c2410c" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="1662.5" dy="0">systemDidWake</tspan></text>
+<text x="1850" y="291" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="1850" dy="0">WAKING(attempt)</tspan><tspan x="1850" dy="20">等待 0.5 / 1 / 2 s</tspan><tspan x="1850" dy="20">generation++</tspan><tspan x="1850" dy="20">重建三个监听器</tspan><tspan x="1850" dy="20">device = absent</tspan></text>
+<text x="1345" y="455" text-anchor="middle" fill="#b45309" font-family="Menlo, PingFang SC, monospace" font-size="15"><tspan x="1345" dy="0">监听重建成功 -&gt; RUNNING；设备恢复继续由内层状态机完成</tspan></text>
+<text x="1445" y="235" text-anchor="middle" fill="#b91c1c" font-family="Menlo, PingFang SC, monospace" font-size="15"><tspan x="1445" dy="0">applicationWillTerminate（从任何非 STOPPED 状态进入）</tspan></text>
+<text x="2125" y="301" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="2125" dy="0">STOPPING</tspan><tspan x="2125" dy="20">可写则恢复原模式</tspan><tspan x="2125" dy="20">回读 / 超时有界</tspan><tspan x="2125" dy="20">注销全部监听</tspan></text>
+<text x="1110" y="510" text-anchor="middle" fill="#b91c1c" font-family="Menlo, PingFang SC, monospace" font-size="15"><tspan x="1110" dy="0">恢复完成或有界失败后都必须释放资源并回到 STOPPED</tspan></text>
+<text x="70" y="605" text-anchor="start" fill="#1e40af" font-family="Menlo, PingFang SC, monospace" font-size="25"><tspan x="70" dy="0">2. 内层 DeviceState：只在 lifecycle == RUNNING 时推进</tspan></text>
+<text x="1100" y="601" text-anchor="start" fill="#dc2626" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="1100" dy="0">任一状态收到 systemWillSleep -&gt; INVALIDATE -&gt; ABSENT，随后交回外层 SUSPENDING</tspan></text>
+<text x="190" y="751" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="18"><tspan x="190" dy="0">ABSENT</tspan><tspan x="190" dy="22.5">无可用 HID++ 通道</tspan></text>
+<text x="365" y="669" text-anchor="middle" fill="#1e40af" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="365" dy="0">deviceMatched</tspan><tspan x="365" dy="17.5">或 Receiver 0x41</tspan><tspan x="365" dy="17.5">connected</tspan></text>
+<text x="555" y="729.5" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="17"><tspan x="555" dy="0">CHANNEL_READY</tspan><tspan x="555" dy="21.25">已选 transport</tspan><tspan x="555" dy="21.25">已安装 raw callback</tspan><tspan x="555" dy="21.25">尚未证明鼠标可响应</tspan></text>
+<text x="745" y="714" text-anchor="middle" fill="#1e3a5f" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="745" dy="0">takeoverRequested</tspan><tspan x="745" dy="17.5">或显式重试</tspan></text>
+<text x="940" y="731" text-anchor="middle" fill="#ffffff" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="940" dy="0">DISCOVERING</tspan><tspan x="940" dy="20">Receiver 扫描 slot 1...6</tspan><tspan x="940" dy="20">Bluetooth index = 0xff</tspan><tspan x="940" dy="20">发现 0x2121 / 0x2150</tspan></text>
+<text x="1132.5" y="729" text-anchor="middle" fill="#047857" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="1132.5" dy="0">发现成功</tspan></text>
+<text x="1340" y="721" text-anchor="middle" fill="#ffffff" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="1340" dy="0">CONFIGURING</tspan><tspan x="1340" dy="20">保存接管前模式</tspan><tspan x="1340" dy="20">SetMode 主轮 / 横向轮</tspan><tspan x="1340" dy="20">GetMode 回读验证</tspan><tspan x="1340" dy="20">成功前 verifiedAxes = none</tspan></text>
+<text x="1550" y="714" text-anchor="middle" fill="#047857" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="1550" dy="0">写入 + 回读</tspan><tspan x="1550" dy="17.5">全部成功</tspan></text>
+<text x="1750" y="729.5" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="17"><tspan x="1750" dy="0">READY(session)</tspan><tspan x="1750" dy="21.25">route + restoreMode 有效</tspan><tspan x="1750" dy="21.25">verifiedAxes 已证明</tspan><tspan x="1750" dy="21.25">允许模型输出与相关抑制</tspan></text>
+<text x="1750" y="979" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="1750" dy="0">VERIFYING</tspan><tspan x="1750" dy="20">showWindow / 显式校验</tspan><tspan x="1750" dy="20">GetMode；漂移则重写并回读</tspan><tspan x="1750" dy="20">期间输出保持 fail-open</tspan></text>
+<text x="1860" y="879" text-anchor="start" fill="#047857" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="1860" dy="0">一致或修复成功</tspan><tspan x="1860" dy="17.5">-&gt; READY</tspan></text>
+<text x="2100" y="721" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="2100" dy="0">RESTORING</tspan><tspan x="2100" dy="20">用户关闭接管</tspan><tspan x="2100" dy="20">写回 restoreMode 并回读</tspan><tspan x="2100" dy="20">成功后保留通道</tspan><tspan x="2100" dy="20">失败 -&gt; FAILED</tspan></text>
+<text x="1930" y="714" text-anchor="middle" fill="#6d28d9" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="1930" dy="0">用户 OFF</tspan><tspan x="1930" dy="17.5">intent=false</tspan></text>
+<text x="1180" y="885" text-anchor="middle" fill="#6d28d9" font-family="Menlo, PingFang SC, monospace" font-size="15"><tspan x="1180" dy="0">恢复并回读成功 -&gt; CHANNEL_READY（通道仍在，但不再接管）</tspan></text>
+<text x="1285" y="1024" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="1285" dy="0">FAILED(error, attempt)</tspan><tspan x="1285" dy="20">verifiedAxes = none</tspan><tspan x="1285" dy="20">清 active route / pending request</tspan><tspan x="1285" dy="20">保留 takeoverRequested</tspan><tspan x="1285" dy="20">决定有限重试或等待事件</tspan></text>
+<text x="1350" y="914" text-anchor="start" fill="#b91c1c" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="1350" dy="0">发现 / 写入 / 回读</tspan><tspan x="1350" dy="17.5">任一步失败</tspan></text>
+<text x="805" y="1024" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="805" dy="0">WAITING_EVENT</tspan><tspan x="805" dy="20">重试耗尽，不轮询</tspan><tspan x="805" dy="20">等待 deviceMatched</tspan><tspan x="805" dy="20">Receiver link-up / showWindow</tspan><tspan x="805" dy="20">或用户手动重试</tspan></text>
+<text x="1045" y="914" text-anchor="middle" fill="#b45309" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="1045" dy="0">attempt &lt; 3</tspan><tspan x="1045" dy="17.5">retryTimer + generation 匹配</tspan></text>
+<text x="1045" y="1066" text-anchor="middle" fill="#b91c1c" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="1045" dy="0">attempt &gt;= 3</tspan></text>
+<text x="550" y="944" text-anchor="middle" fill="#1e40af" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="550" dy="0">真实设备事件</tspan><tspan x="550" dy="17.5">-&gt; CHANNEL_READY</tspan><tspan x="550" dy="17.5">手动重试 -&gt; DISCOVERING</tspan></text>
+<text x="1055" y="630" text-anchor="middle" fill="#dc2626" font-family="Menlo, PingFang SC, monospace" font-size="15"><tspan x="1055" dy="0">deviceRemoved / Receiver disconnected / transport 切换：清 route、feature、battery、verifiedAxes；无替代通道 -&gt; ABSENT</tspan></text>
+<text x="1935" y="619" text-anchor="start" fill="#047857" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="1935" dy="0">0x11 wheel / thumbwheel / battery</tspan><tspan x="1935" dy="17.5">CGEvent scroll / tap re-enable</tspan><tspan x="1935" dy="17.5">均为 READY 自循环，不改变设备状态</tspan></text>
+<text x="1590" y="889" text-anchor="middle" fill="#dc2626" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="1590" dy="0">存在备用 transport</tspan><tspan x="1590" dy="17.5">-&gt; CHANNEL_READY，重新发现路由</tspan></text>
+<text x="352.5" y="419" text-anchor="middle" fill="#b91c1c" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="352.5" dy="0">监听创建失败：清理资源 + 报错 -&gt; STOPPED</tspan></text>
+<text x="2110" y="179" text-anchor="middle" fill="#b45309" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="2110" dy="0">重建失败</tspan><tspan x="2110" dy="17.5">attempt &lt; 3：WAKING(next)</tspan><tspan x="2110" dy="17.5">attempt &gt;= 3：停留并等待手动重试</tspan></text>
+<text x="70" y="1245" text-anchor="start" fill="#1e40af" font-family="Menlo, PingFang SC, monospace" font-size="25"><tspan x="70" dy="0">3. 正交状态数据：用户意图与异步代际</tspan></text>
+<text x="215" y="1371.25" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="17"><tspan x="215" dy="0">INTENT OFF</tspan><tspan x="215" dy="21.25">takeoverRequested=false</tspan></text>
+<text x="425" y="1324" text-anchor="middle" fill="#047857" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="425" dy="0">用户 ON</tspan><tspan x="425" dy="17.5">保存意图，不要求设备当前在线</tspan></text>
+<text x="645" y="1371.25" text-anchor="middle" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="17"><tspan x="645" dy="0">INTENT ON</tspan><tspan x="645" dy="21.25">takeoverRequested=true</tspan></text>
+<text x="425" y="1424" text-anchor="middle" fill="#6d28d9" font-family="Menlo, PingFang SC, monospace" font-size="14"><tspan x="425" dy="0">用户 OFF</tspan><tspan x="425" dy="17.5">READY 时进入 RESTORING</tspan></text>
+<text x="435" y="1486" text-anchor="middle" fill="#64748b" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="435" dy="0">systemWillSleep / deviceRemoved / FAILED 都不修改 INTENT ON；</tspan><tspan x="435" dy="20">设备重新可用时，CHANNEL_READY 自动继续 DISCOVERING</tspan></text>
+<text x="910" y="1341" text-anchor="start" fill="#22c55e" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="910" dy="0">generation 代际规则</tspan><tspan x="910" dy="20"></tspan><tspan x="910" dy="20">STARTING / WAKING / transport replacement -&gt; generation++</tspan><tspan x="910" dy="20">每个 raw callback、异步命令、retryTimer 都捕获 generation</tspan><tspan x="910" dy="20"></tspan><tspan x="910" dy="20">guard event.generation == state.generation else {</tspan><tspan x="910" dy="20">  return  // 丢弃睡眠前或旧设备的迟到结果</tspan><tspan x="910" dy="20">}</tspan></text>
+<text x="1570" y="1341" text-anchor="start" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="16"><tspan x="1570" dy="0">verifiedAxes 安全规则</tspan><tspan x="1570" dy="20"></tspan><tspan x="1570" dy="20">仅 CONFIGURING / VERIFYING 完成 SetMode + GetMode 后设置</tspan><tspan x="1570" dy="20">进入 SUSPENDING、ABSENT、FAILED、RESTORING 时立即清空</tspan><tspan x="1570" dy="20"></tspan><tspan x="1570" dy="20">输出条件：</tspan><tspan x="1570" dy="20">lifecycle == RUNNING</tspan><tspan x="1570" dy="20">&amp;&amp; device == READY</tspan><tspan x="1570" dy="20">&amp;&amp; takeoverRequested</tspan><tspan x="1570" dy="20">&amp;&amp; verifiedAxes.contains(axis)</tspan><tspan x="1570" dy="20">否则 CGEvent 必须 fail-open</tspan></text>
+<text x="70" y="1645" text-anchor="start" fill="#1e40af" font-family="Menlo, PingFang SC, monospace" font-size="25"><tspan x="70" dy="0">4. 协调器 reducer 的全局不变量</tspan></text>
+<text x="125" y="1732" text-anchor="start" fill="#374151" font-family="Menlo, PingFang SC, monospace" font-size="17"><tspan x="125" dy="0">1. 只有 MouseRuntimeCoordinator 可以修改 MouseRuntimeState；Monitor 只发送 Event，Controller 只执行 Command 并返回 Result。</tspan><tspan x="125" dy="21.25">2. lifecycle != RUNNING 时，device 必须是 ABSENT，verifiedAxes 必须为空，任何滚动抑制都 fail-open。</tspan><tspan x="125" dy="21.25">3. device == READY 必须携带当前 generation 的 DeviceSession；旧 route、slot、feature index 永不跨 generation 复用。</tspan><tspan x="125" dy="21.25">4. takeoverRequested 是用户长期意图，睡眠、插拔和临时失败不能清除；只有用户 OFF 或终止流程改变它。</tspan><tspan x="125" dy="21.25">5. 所有失败路径有界：清可信状态 -&gt; 最多三次重试 -&gt; WAITING_EVENT；禁止递归无限扫描。</tspan><tspan x="125" dy="21.25">6. applicationWillTerminate 优先级最高：拒绝新事件，取消重试，可写则恢复硬件，最终一定释放 callback/run-loop source。</tspan><tspan x="125" dy="21.25">7. UI 完全由聚合状态派生，不允许 DeviceConnectionMonitor 的“存在”直接覆盖 HID++ 可用性或 READY。</tspan></text>
+</g></svg>
