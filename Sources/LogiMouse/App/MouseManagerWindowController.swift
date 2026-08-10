@@ -6,8 +6,10 @@ final class MouseManagerWindowController: NSWindowController {
         static let scrollDirection = "scroll-direction"
     }
 
-    private let coordinator = MouseControlCoordinator()
-    private let connectionMonitor = DeviceConnectionMonitor()
+    /// The window observes one application-level runtime owner. Device
+    /// presence, HID++ readiness and power transitions must not be managed by
+    /// independent UI monitors, or they can disagree after system wake.
+    private let coordinator = MouseRuntimeCoordinator()
 
     private let deviceIcon = NSImageView()
     private let deviceNameLabel = NSTextField(labelWithString: "未检测到设备")
@@ -56,7 +58,6 @@ final class MouseManagerWindowController: NSWindowController {
     }
 
     func startAutomatically() {
-        connectionMonitor.start()
         do {
             try coordinator.start()
             updateSmoothControlAvailability()
@@ -202,10 +203,21 @@ final class MouseManagerWindowController: NSWindowController {
     }
 
     private func wireCallbacks() {
+        coordinator.onRuntimeStateChange = { [weak self] state in
+            guard let self else { return }
+            // A power transition invalidates any in-flight UI transaction. The
+            // switch reflects durable user intent; verified hardware state is
+            // deliberately not inferred from this visual state.
+            if !state.isRunning {
+                self.smoothTransitionInProgress = false
+                self.smoothScrollingSwitch.state = state.takeoverRequested ? .on : .off
+            }
+            self.updateSmoothControlAvailability()
+        }
         coordinator.onStatusChange = { [weak self] status in
             DispatchQueue.main.async { self?.statusLabel.stringValue = status }
         }
-        connectionMonitor.onConnectionChange = { [weak self] connection in
+        coordinator.onConnectionChange = { [weak self] connection in
             guard let self else { return }
             self.detectedConnection = connection
             if connection == .disconnected || !self.runtimeConnectionUnavailable {
@@ -469,7 +481,6 @@ final class MouseManagerWindowController: NSWindowController {
     }
 
     func prepareForTermination() {
-        connectionMonitor.stop()
         coordinator.stop()
     }
 }

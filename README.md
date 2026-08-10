@@ -9,6 +9,7 @@
 - 想直接使用：阅读[快速开始](#快速开始)和[运行与权限](#运行与权限)。
 - 想了解硬件差异：阅读[USB Receiver 与 Bluetooth 的区别](#usb-receiver-与-bluetooth-的区别)。
 - 想了解踩过的坑：阅读[问题复盘](#问题复盘)。
+- 想了解睡眠唤醒与设备恢复：阅读[运行时状态机](#运行时状态机)和[完整设计说明](docs/mouse-runtime-coordinator.md)。
 - 想了解滚动算法：阅读[曲线分析](#曲线分析)和[离线验证结果](#离线验证结果)。
 - 想参与开发：阅读[构建与测试](#构建与测试)和[关键代码](#关键代码)。
 
@@ -29,6 +30,22 @@ open .build/logi-mouse.app
 - 支持自然滚动和标准滚动；方向只在输出端转换，不改变幅度曲线。
 - USB Receiver 使用槽位 `1...6`；Bluetooth 使用直连索引 `0xff`。切换传输时会清除旧路由并重新发现 feature index。
 - 主应用不再包含数据采集和分析界面；历史工具位于 `Diagnostics/LegacyCapture/`，不参与产品编译。
+
+## 运行时状态机
+
+`MouseRuntimeCoordinator` 是应用内唯一的运行时状态所有者。系统睡眠/唤醒、设备插拔、用户开关、HID++ 命令结果和恢复定时器都先转换成事件，再由纯 reducer 计算新状态和待执行副作用。
+
+![MouseRuntimeCoordinator 完整状态流转图](docs/mouse-runtime-coordinator-state-machine.svg)
+
+图中需要区分三类信息：
+
+- `lifecycle` 表示监听资源处于启动、运行、睡眠、唤醒还是停止阶段。
+- `device` 表示当前 HID++ 会话处于缺失、发现、配置、校验或就绪阶段。
+- `takeoverRequested` 是跨睡眠和断连保留的用户意图；`verifiedAxes` 是当前硬件会话的校验事实，失去硬件可信度时立即清空。
+
+每次启动、睡眠、唤醒或停止都会递增 `generation`。旧 generation 的设备回调、命令结果和重试任务全部丢弃，防止睡眠前的 IOHID 对象在唤醒后重新污染状态。只有运行时为 `running`、设备为 `ready` 且对应滚轮轴已经写后回读验证，应用才会抑制原生滚动并注入模型输出。
+
+睡眠到唤醒的逐事件流程见[系统睡眠唤醒细化图](docs/system-sleep-wake-flow.svg)，状态定义、四层职责和失败恢复策略见[完整设计说明](docs/mouse-runtime-coordinator.md)。
 
 ## USB Receiver 与 Bluetooth 的区别
 
@@ -73,6 +90,7 @@ Bluetooth 慢速滚动曾因 parsed-element `IOHIDQueue` 合并和调度时序�
 | 报错 `No HID++ device responded...` | 传输切换后仍使用旧槽位/feature，或 Bluetooth 匹配方式不正确 | 切换时清理路由；Receiver 重新扫描槽位，Bluetooth 使用 `0xff` 并重新发现 feature |
 | 鼠标断开后主界面仍显示连接 | 只根据泛化设备或已插入 Receiver 判断，未跟踪真实接口和链路 | Bluetooth 跟踪 `IOHIDInterface` 生命周期；Receiver 解析 `0x10/0x41` 链路通知 |
 | 鼠标断开后不断重试扫描 | 接管意图保留后，失败路径每 `0.35 s` 递归重试 | 改为事件驱动；一次事件只恢复一次，失败后等待下一次设备连接事件或窗口重新显示 |
+| 系统唤醒后无法恢复监听 | 睡眠前的 IOHID 对象、回调和 HID++ 路由在唤醒后已不可信，原实现没有统一重建运行时资源 | 使用单一运行时协调器；睡眠时无写入挂起，唤醒后按新 generation 重建监听、有限重试并重新校验接管模式 |
 
 ## 数据链路
 

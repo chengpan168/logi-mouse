@@ -140,8 +140,14 @@ final class HIDMonitor {
         }
     }
 
-    func takeOverWheel(completion: @escaping (Result<HIDPPController.State, Error>) -> Void) {
-        controller.takeOverWheel(completion: completion)
+    func takeOverWheel(
+        preserveRequestOnFailure: Bool = false,
+        completion: @escaping (Result<HIDPPController.State, Error>) -> Void
+    ) {
+        controller.takeOverWheel(
+            preserveRequestOnFailure: preserveRequestOnFailure,
+            completion: completion
+        )
     }
 
     func restoreWheel(completion: @escaping (Result<HIDPPController.State, Error>) -> Void) {
@@ -226,10 +232,30 @@ final class HIDMonitor {
     }
 
     func stop() {
+        teardown(restoringHardware: true)
+    }
+
+    /// Releases the current HID generation without issuing hardware commands.
+    ///
+    /// A system-sleep notification can arrive after the mouse radio or USB stack
+    /// has already stopped answering. Calling `restoreSynchronously()` there
+    /// would delay sleep until request timeout. User intent is retained by the
+    /// runtime coordinator and a fresh controller reapplies it after wake.
+    func suspend() {
+        teardown(restoringHardware: false)
+    }
+
+    private func teardown(restoringHardware: Bool) {
         guard let manager else { return }
-        // Restore hardware before unregistering the report callback: restore
-        // requests need their 0x11 replies to wake HIDPPController.call().
-        controller.restoreSynchronously()
+        if restoringHardware {
+            // Restore hardware before unregistering the report callback: restore
+            // requests need their 0x11 replies to wake HIDPPController.call().
+            controller.restoreSynchronously()
+        } else {
+            // Reject late reports before unregistering their callback contexts.
+            // The old controller generation must never recover independently.
+            controller.invalidateForSystemSleep()
+        }
         removeAllSubscriptions()
         managerIsOpen = false
         pendingDevices.removeAll()

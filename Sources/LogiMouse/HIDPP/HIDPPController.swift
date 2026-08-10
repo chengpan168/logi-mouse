@@ -46,6 +46,7 @@ struct HIDPPTakeoverAxes: Equatable, Sendable {
 
     static let none = HIDPPTakeoverAxes()
     var isEmpty: Bool { !vertical && !horizontal }
+    var isComplete: Bool { vertical && horizontal }
 }
 
 enum HIDPPBatteryState: Equatable, Sendable {
@@ -370,7 +371,10 @@ final class HIDPPController {
 
     /// Begins the all-axis hardware transaction on `operationQueue`.
     /// Completion is delivered on the main queue for direct UI consumption.
-    func takeOverWheel(completion: @escaping (Result<State, Error>) -> Void) {
+    func takeOverWheel(
+        preserveRequestOnFailure: Bool = false,
+        completion: @escaping (Result<State, Error>) -> Void
+    ) {
         setTakeoverRequested(true)
         operationQueue.async { [weak self] in
             guard let self else { return }
@@ -378,7 +382,13 @@ final class HIDPPController {
                 let ready = try self.performTakeover()
                 DispatchQueue.main.async { completion(.success(ready)) }
             } catch {
-                self.setTakeoverRequested(false)
+                // A user-initiated enable failure turns intent back off. Runtime
+                // recovery is different: its application-level intent survives
+                // sleep, so keep the controller armed for a later matching or
+                // Receiver link-up event after this bounded attempt fails.
+                if !preserveRequestOnFailure {
+                    self.setTakeoverRequested(false)
+                }
                 // A SetMode request may have reached the mouse even when its
                 // response or verification read timed out. Restore the saved
                 // pre-takeover mode before reporting the failed activation.
@@ -450,6 +460,27 @@ final class HIDPPController {
         while group.wait(timeout: .now()) == .timedOut {
             RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
         }
+    }
+
+    /// Invalidates the complete physical session without writing to hardware.
+    ///
+    /// This is used only for system sleep. The application-level coordinator
+    /// preserves the user's takeover intent, while this controller deliberately
+    /// forgets every IOHIDDevice, route and pending request from the old power
+    /// generation. A newly created controller will rediscover them after wake.
+    func invalidateForSystemSleep() {
+        stateLock.lock()
+        takeoverRequested = false
+        channels.removeAll()
+        selectedChannelKey = nil
+        resetRouteStateLocked(for: nil)
+        stateLock.unlock()
+
+        cancelPendingRequest()
+        publishTakeoverAxes(.none)
+        publishBatteryState(.unavailable)
+        transition(to: .unavailable)
+        log("hidpp_controller_suspended", "invalidated old power generation")
     }
 
     // MARK: - Takeover transaction

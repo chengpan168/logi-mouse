@@ -14,6 +14,19 @@ private func makeMainMenu() -> NSMenu {
     quitItem.keyEquivalentModifierMask = [.command]
     applicationMenu.addItem(quitItem)
     applicationItem.submenu = applicationMenu
+
+    let fileItem = NSMenuItem()
+    mainMenu.addItem(fileItem)
+    let fileMenu = NSMenu(title: "File")
+    let closeWindowItem = NSMenuItem(
+        title: "Close Window",
+        action: #selector(NSWindow.performClose(_:)),
+        keyEquivalent: "w"
+    )
+    closeWindowItem.keyEquivalentModifierMask = [.command]
+    fileMenu.addItem(closeWindowItem)
+    fileItem.submenu = fileMenu
+
     return mainMenu
 }
 
