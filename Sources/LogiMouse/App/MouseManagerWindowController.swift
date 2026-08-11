@@ -234,7 +234,7 @@ final class MouseManagerWindowController: NSWindowController {
             case .unavailable, .failed:
                 self.runtimeConnectionUnavailable = true
                 self.applyConnection(.disconnected)
-            case let .channelReady(transport):
+            case let .channelReady(transport), let .deviceReady(transport):
                 // A Bluetooth interface exists only while its mouse link is
                 // alive. For Receiver transport this state is also emitted by
                 // the 0x41 link-up notification handled in HIDMonitor.

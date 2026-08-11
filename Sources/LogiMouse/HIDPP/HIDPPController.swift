@@ -83,6 +83,9 @@ final class HIDPPController {
     enum State: Equatable, Sendable, CustomStringConvertible {
         case unavailable
         case channelReady(HIDPPTransport)
+        /// The actual mouse, rather than merely its Receiver interface, has
+        /// published readiness evidence suitable for starting takeover.
+        case deviceReady(HIDPPTransport)
         case discovering
         case ready(deviceIndex: UInt8, featureIndex: UInt8, mode: HIDPPProtocol.WheelMode)
         case failed(String)
@@ -91,6 +94,7 @@ final class HIDPPController {
             switch self {
             case .unavailable: "unavailable"
             case let .channelReady(transport): "channel-ready: \(transport)"
+            case let .deviceReady(transport): "device-ready: \(transport)"
             case .discovering: "discovering"
             case let .ready(deviceIndex, featureIndex, mode):
                 String(
@@ -184,19 +188,17 @@ final class HIDPPController {
         if channelChanged {
             resetRouteStateLocked(for: selected?.transport)
         }
-        let shouldReacquire = takeoverRequested
         stateLock.unlock()
 
         if channelChanged { publishTakeoverAxes(.none) }
 
         guard channelChanged, let selected else { return }
         cancelPendingRequest()
-        transition(to: .channelReady(selected.transport))
+        transition(to: selected.transport == .bluetooth
+            ? .deviceReady(.bluetooth)
+            : .channelReady(.usbReceiver))
         log("hidpp_controller_device", "selected \(selected.transport) HID++ channel")
         refreshBattery(after: 0.15)
-        if shouldReacquire {
-            scheduleReacquire(after: 0.15)
-        }
     }
 
     /// Removes a physical interface. If Bluetooth disappears while a Receiver
@@ -211,7 +213,6 @@ final class HIDPPController {
         }
         let replacement = selectedChannelLocked()
         if wasSelected { resetRouteStateLocked(for: replacement?.transport) }
-        let shouldReacquire = takeoverRequested
         stateLock.unlock()
 
         if wasSelected {
@@ -219,19 +220,12 @@ final class HIDPPController {
             publishBatteryState(.unavailable)
             cancelPendingRequest()
             if let replacement {
-                transition(to: .channelReady(replacement.transport))
+                transition(to: replacement.transport == .bluetooth
+                    ? .deviceReady(.bluetooth)
+                    : .channelReady(.usbReceiver))
                 log("hidpp_controller_device", "fell back to \(replacement.transport) HID++ channel")
                 if replacement.transport == .bluetooth {
                     refreshBattery(after: 0.15)
-                }
-                // A Receiver interface remains present even when its paired
-                // mouse is offline. Do not scan its slots merely because a
-                // Bluetooth channel disappeared; wait for the Receiver's
-                // 0x41 connection notification or actual HID++ activity.
-                if shouldReacquire, replacement.transport == .bluetooth {
-                    scheduleReacquire(after: 0.15)
-                } else if shouldReacquire {
-                    transition(to: .unavailable)
                 }
             } else {
                 transition(to: .unavailable)
@@ -282,7 +276,6 @@ final class HIDPPController {
         if isSelectedReceiver, event.isConnected {
             observedDeviceIndex = event.deviceIndex
         }
-        let shouldReacquire = isSelectedReceiver && event.isConnected && takeoverRequested
         if isSelectedReceiver, !event.isConnected {
             activeWheel = nil
             activeThumbwheel = nil
@@ -299,15 +292,8 @@ final class HIDPPController {
         guard isSelectedReceiver else { return }
         if event.isConnected {
             log("hidpp_receiver_connected", "slot=\(event.deviceIndex)")
-            transition(to: .channelReady(.usbReceiver))
+            transition(to: .deviceReady(.usbReceiver))
             refreshBattery(after: 0.05)
-            if shouldReacquire {
-                if hasActiveWheel {
-                    verifyMode()
-                } else {
-                    scheduleReacquire(after: 0.05)
-                }
-            }
         } else {
             publishBatteryState(.unavailable)
             cancelPendingRequest()
@@ -332,14 +318,30 @@ final class HIDPPController {
 
     /// Performs one read-back requested by a low-frequency lifecycle event,
     /// such as reopening the control window. Scroll traffic never calls this.
-    func verifyMode() {
+    func verifyMode(
+        completion: @escaping (Result<HIDPPTakeoverAxes, Error>) -> Void = { _ in }
+    ) {
         operationQueue.async { [weak self] in
-            guard let self, self.isTakeoverRequested else { return }
-            guard self.hasActiveWheel else {
-                self.scheduleReacquire(after: 0)
+            guard let self else { return }
+            guard self.isTakeoverRequested else {
+                DispatchQueue.main.async {
+                    completion(.failure(HIDPPControllerError.deviceNotFound))
+                }
                 return
             }
-            self.verifyActiveMode()
+            guard self.hasActiveWheel else {
+                self.scheduleReacquire(after: 0)
+                DispatchQueue.main.async {
+                    completion(.failure(HIDPPControllerError.deviceNotFound))
+                }
+                return
+            }
+            do {
+                let axes = try self.verifyActiveMode()
+                DispatchQueue.main.async { completion(.success(axes)) }
+            } catch {
+                DispatchQueue.main.async { completion(.failure(error)) }
+            }
         }
     }
 
@@ -1091,12 +1093,12 @@ final class HIDPPController {
     /// Reads both physical sensor modes and repairs drift only after comparing
     /// firmware state. Any missing response invalidates verified suppression
     /// immediately; a later device event or window open may trigger recovery.
-    private func verifyActiveMode() {
+    private func verifyActiveMode() throws -> HIDPPTakeoverAxes {
         stateLock.lock()
         let activeWheel = self.activeWheel
         let activeThumbwheel = self.activeThumbwheel
         stateLock.unlock()
-        guard let activeWheel else { return }
+        guard let activeWheel else { throw HIDPPControllerError.deviceNotFound }
 
         let desiredMode = HIDPPProtocol.WheelMode.divertedHighResolution
         do {
@@ -1162,6 +1164,18 @@ final class HIDPPController {
                     log("hidpp_thumbwheel_mode_reasserted", thumbwheelReadBack.description)
                 }
             }
+            stateLock.lock()
+            verifiedTakeoverAxes.vertical = true
+            verifiedTakeoverAxes.horizontal = activeThumbwheel != nil
+            let axes = verifiedTakeoverAxes
+            stateLock.unlock()
+            publishTakeoverAxes(axes)
+            transition(to: .ready(
+                deviceIndex: activeWheel.deviceIndex,
+                featureIndex: activeWheel.featureIndex,
+                mode: desiredMode
+            ))
+            return axes
         } catch {
             // A missing response means the active mouse is gone or asleep.
             // Bluetooth arrival, Receiver 0x41 or reopening the control window
@@ -1176,6 +1190,7 @@ final class HIDPPController {
             publishTakeoverAxes(.none)
             transition(to: .unavailable)
             log("hidpp_mode_verification_failed", error.localizedDescription)
+            throw error
         }
     }
 

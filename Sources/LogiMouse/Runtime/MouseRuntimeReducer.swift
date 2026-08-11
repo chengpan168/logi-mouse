@@ -20,7 +20,11 @@ enum MouseRuntimeEvent: Sendable {
     case takeoverSucceeded(generation: UInt64)
     case takeoverFailed(message: String, recoveryAttempt: Int?, generation: UInt64)
     case verificationStarted(generation: UInt64)
+    case verificationSucceeded(HIDPPTakeoverAxes, generation: UInt64)
+    case verificationFailed(message: String, generation: UInt64)
     case restorationStarted(generation: UInt64)
+    case restorationSucceeded(generation: UInt64)
+    case restorationFailed(message: String, generation: UInt64)
     case takeoverAxesChanged(HIDPPTakeoverAxes, generation: UInt64)
 }
 
@@ -31,7 +35,6 @@ enum MouseRuntimeEffect: Equatable, Sendable {
     case suspendMonitoring(generation: UInt64)
     case scheduleWakeStart(attempt: Int, generation: UInt64, delay: TimeInterval)
     case recoverTakeover(attempt: Int, generation: UInt64)
-    case scheduleTakeoverRecovery(attempt: Int, generation: UInt64, delay: TimeInterval)
     case stopMonitoring(generation: UInt64)
 }
 
@@ -58,7 +61,12 @@ struct MouseRuntimeReducer {
                 return []
             case .waking:
                 state.lifecycle = .running
-                guard state.takeoverRequested else { return [] }
+                // A synchronous IOHID match may have published deviceReady
+                // inside startMonitoring, before monitoringStarted arrives.
+                // Preserve that evidence and act on it only after the runtime
+                // has formally entered the running lifecycle.
+                guard state.takeoverRequested,
+                      case .deviceReady = state.device else { return [] }
                 return [.recoverTakeover(attempt: 1, generation: generation)]
             default:
                 return []
@@ -130,6 +138,11 @@ struct MouseRuntimeReducer {
         case let .controllerState(controllerState, generation):
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
             applyControllerState(controllerState, state: &state)
+            if case .deviceReady = controllerState,
+               state.takeoverRequested,
+               state.lifecycle == .running {
+                return [.recoverTakeover(attempt: 1, generation: generation)]
+            }
             return []
 
         case let .takeoverIntentChanged(requested):
@@ -152,23 +165,27 @@ struct MouseRuntimeReducer {
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
             state.verifiedAxes = .none
             state.device = .failed(message)
-            guard let attempt = recoveryAttempt else { return [] }
-            guard attempt < Self.recoveryDelays.count else {
+            if recoveryAttempt != nil {
                 state.device = .waitingForEvent(message)
-                return []
             }
-            let nextAttempt = attempt + 1
-            return [
-                .scheduleTakeoverRecovery(
-                    attempt: nextAttempt,
-                    generation: generation,
-                    delay: Self.recoveryDelays[nextAttempt - 1]
-                )
-            ]
+            return []
 
         case let .verificationStarted(generation):
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
             state.device = .verifying(state.selectedTransport)
+            state.verifiedAxes = .none
+            return []
+
+        case let .verificationSucceeded(axes, generation):
+            guard acceptsRuntimeCallback(generation: generation, state: state),
+                  state.takeoverRequested else { return [] }
+            state.device = .ready(state.selectedTransport)
+            state.verifiedAxes = axes
+            return []
+
+        case let .verificationFailed(message, generation):
+            guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
+            state.device = .waitingForEvent(message)
             state.verifiedAxes = .none
             return []
 
@@ -177,6 +194,21 @@ struct MouseRuntimeReducer {
             state.device = .restoring(state.selectedTransport)
             state.verifiedAxes = .none
             return []
+
+        case let .restorationSucceeded(generation):
+            guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
+            state.device = state.selectedTransport.map(MouseRuntimeDeviceState.channelReady) ?? .absent
+            state.verifiedAxes = .none
+            return []
+
+        case let .restorationFailed(message, generation):
+            guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
+            // Restoring may fail after one axis was already written. Re-arm both
+            // state owners immediately and use the bounded takeover recovery path.
+            state.takeoverRequested = true
+            state.device = .failed(message)
+            state.verifiedAxes = .none
+            return [.recoverTakeover(attempt: 1, generation: generation)]
 
         case let .takeoverAxesChanged(axes, generation):
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
@@ -227,6 +259,10 @@ struct MouseRuntimeReducer {
         case let .channelReady(transport):
             state.selectedTransport = transport
             state.device = .channelReady(transport)
+            state.verifiedAxes = .none
+        case let .deviceReady(transport):
+            state.selectedTransport = transport
+            state.device = .deviceReady(transport)
             state.verifiedAxes = .none
         case .discovering:
             state.device = .discovering(state.selectedTransport)

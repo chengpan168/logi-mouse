@@ -24,6 +24,7 @@ enum MouseRuntimeLifecycleState: Equatable, Sendable {
 enum MouseRuntimeDeviceState: Equatable, Sendable {
     case absent
     case channelReady(HIDPPTransport)
+    case deviceReady(HIDPPTransport)
     case discovering(HIDPPTransport?)
     case configuring(HIDPPTransport?)
     case ready(HIDPPTransport?)
@@ -62,4 +63,3 @@ struct MouseRuntimeState: Equatable, Sendable {
         }
     }
 }
-

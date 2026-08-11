@@ -35,7 +35,7 @@ final class MouseRuntimeCoordinator {
     private var hidMonitor: HIDMonitor?
     private var eventMonitor: CGEventMonitor?
     private var wakeRetryWorkItem: DispatchWorkItem?
-    private var takeoverRetryWorkItem: DispatchWorkItem?
+    private var takeoverRecoveryInFlight = false
 
     private var verticalModel = ScrollDynamicsModel()
     private var horizontalModel = ScrollDynamicsModel()
@@ -123,10 +123,14 @@ final class MouseRuntimeCoordinator {
             hidMonitor.restoreWheel { [weak self] result in
                 guard let self,
                       self.runtimeState.generation == generation else { return }
-                if case .failure = result {
-                    // The settings window restores its ON state on failure; keep
-                    // the coordinator's durable intent consistent with that UI.
-                    try? self.send(.takeoverIntentChanged(true))
+                switch result {
+                case .success:
+                    try? self.send(.restorationSucceeded(generation: generation))
+                case let .failure(error):
+                    try? self.send(.restorationFailed(
+                        message: error.localizedDescription,
+                        generation: generation
+                    ))
                 }
                 completion(result)
             }
@@ -142,8 +146,21 @@ final class MouseRuntimeCoordinator {
     /// Ordinary scroll reports remain pure data events and never enter this path.
     func verifyTakeoverMode() {
         guard isRunning, isTakeoverEnabled else { return }
-        try? send(.verificationStarted(generation: runtimeState.generation))
-        hidMonitor?.verifyWheelMode()
+        let generation = runtimeState.generation
+        try? send(.verificationStarted(generation: generation))
+        hidMonitor?.verifyWheelMode { [weak self] result in
+            guard let self,
+                  self.runtimeState.generation == generation else { return }
+            switch result {
+            case let .success(axes):
+                try? self.send(.verificationSucceeded(axes, generation: generation))
+            case let .failure(error):
+                try? self.send(.verificationFailed(
+                    message: error.localizedDescription,
+                    generation: generation
+                ))
+            }
+        }
     }
 
     func refreshBattery() {
@@ -232,18 +249,6 @@ final class MouseRuntimeCoordinator {
         case let .recoverTakeover(attempt, generation):
             recoverTakeover(attempt: attempt, generation: generation)
 
-        case let .scheduleTakeoverRecovery(attempt, generation, delay):
-            takeoverRetryWorkItem?.cancel()
-            let item = DispatchWorkItem { [weak self] in
-                guard let self,
-                      self.runtimeState.generation == generation,
-                      self.runtimeState.takeoverRequested,
-                      self.runtimeState.isRunning else { return }
-                self.recoverTakeover(attempt: attempt, generation: generation)
-            }
-            takeoverRetryWorkItem = item
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
-
         case let .stopMonitoring(generation):
             cancelScheduledWork()
             stopRuntimeMonitors(restoringHardware: true)
@@ -326,14 +331,6 @@ final class MouseRuntimeCoordinator {
             guard let self,
                   self.runtimeState.generation == generation else { return }
             try? self.send(.takeoverAxesChanged(axes, generation: generation))
-            // HIDPPController can recover from a later Bluetooth match or
-            // Receiver link-up event before our bounded timer fires. Both axes
-            // being read-back verified is authoritative success, so cancel the
-            // now-obsolete timer and avoid a duplicate takeover transaction.
-            if axes.isComplete {
-                self.takeoverRetryWorkItem?.cancel()
-                self.takeoverRetryWorkItem = nil
-            }
             self.invalidateModels(forLostAxes: axes)
         }
         hidMonitor.onBatteryStateChange = { [weak self] batteryState in
@@ -363,13 +360,16 @@ final class MouseRuntimeCoordinator {
         guard runtimeState.generation == generation,
               runtimeState.takeoverRequested,
               runtimeState.isRunning,
+              !takeoverRecoveryInFlight,
               let hidMonitor else { return }
+        takeoverRecoveryInFlight = true
         try? send(.takeoverStarted(generation: generation))
-        onStatusChange?("正在恢复鼠标接管（第 \(attempt) 次）…")
+        onStatusChange?("设备通道已就绪，正在恢复鼠标接管…")
         hidMonitor.takeOverWheel(preserveRequestOnFailure: true) { [weak self] result in
             guard let self,
                   self.runtimeState.generation == generation,
                   self.runtimeState.isRunning else { return }
+            self.takeoverRecoveryInFlight = false
             switch result {
             case .success:
                 try? self.send(.takeoverSucceeded(generation: generation))
@@ -380,18 +380,15 @@ final class MouseRuntimeCoordinator {
                     recoveryAttempt: attempt,
                     generation: generation
                 ))
-                if attempt >= MouseRuntimeReducer.recoveryDelays.count {
-                    self.onStatusChange?("恢复失败，等待下一次设备连接事件：\(error.localizedDescription)")
-                }
+                self.onStatusChange?("恢复失败，等待设备通道再次就绪：\(error.localizedDescription)")
             }
         }
     }
 
     private func cancelScheduledWork() {
         wakeRetryWorkItem?.cancel()
-        takeoverRetryWorkItem?.cancel()
         wakeRetryWorkItem = nil
-        takeoverRetryWorkItem = nil
+        takeoverRecoveryInFlight = false
     }
 
     // MARK: - Data path
@@ -461,7 +458,7 @@ final class MouseRuntimeCoordinator {
         switch state {
         case .unavailable:
             onStatusChange?("鼠标 HID++ 通道已断开，等待重新连接…")
-        case let .channelReady(transport):
+        case let .channelReady(transport), let .deviceReady(transport):
             onStatusChange?("正在通过 \(transport) 恢复滚轮接管…")
         case .discovering:
             onStatusChange?("正在重新发现鼠标滚轮能力…")

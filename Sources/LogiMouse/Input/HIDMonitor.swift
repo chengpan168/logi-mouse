@@ -154,8 +154,10 @@ final class HIDMonitor {
         controller.restoreWheel(completion: completion)
     }
 
-    func verifyWheelMode() {
-        controller.verifyMode()
+    func verifyWheelMode(
+        completion: @escaping (Result<HIDPPTakeoverAxes, Error>) -> Void
+    ) {
+        controller.verifyMode(completion: completion)
     }
 
     func refreshBattery() {

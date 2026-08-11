@@ -38,3 +38,13 @@ import Testing
     #expect(!axes.isEmpty)
     #expect(HIDPPTakeoverAxes.none.isEmpty)
 }
+
+@Test func suppressionBudgetRemainsAvailableForNativeEventAfterInjection() {
+    let correlation = TargetScrollCorrelation(windowNanoseconds: 30)
+    correlation.record(.vertical, timestampNs: 100)
+
+    // Synthetic output bypasses correlation in CGEventMonitor. The budget must
+    // remain available for the native event that macOS may deliver afterward.
+    #expect(correlation.consumeMatch(.vertical, timestampNs: 110))
+    #expect(!correlation.consumeMatch(.vertical, timestampNs: 110))
+}
