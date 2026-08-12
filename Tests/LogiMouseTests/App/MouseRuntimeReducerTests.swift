@@ -1,6 +1,10 @@
 import Testing
 @testable import LogiMouse
 
+@Test func readinessProbeUsesRequestedBoundedDelays() {
+    #expect(HIDPPDeviceServiceCoordinator.readinessProbeDelays == [0, 1, 2, 3])
+}
+
 @Test func sleepInvalidatesHardwareEvidenceButPreservesUserIntent() {
     var reducer = MouseRuntimeReducer()
     var state = MouseRuntimeState(
