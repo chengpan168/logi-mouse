@@ -141,6 +141,7 @@ final class CGEventMonitor {
     private var suppressionEnabled = false
 
     func start(suppressionEnabled: Bool = false) throws {
+        RuntimeLog.info("cg-event", "Starting CGEvent monitor suppressionEnabled=\(suppressionEnabled)")
         self.suppressionEnabled = suppressionEnabled
         // A listen-only tap cannot suppress events. Enabling model output
         // recreates the tap as a default tap with permission to return nil.
@@ -157,6 +158,7 @@ final class CGEventMonitor {
                     // macOS disables slow or user-disabled taps. Re-enable it
                     // immediately, but pass this event through to fail safely.
                     if let tap = monitor.tap { CGEvent.tapEnable(tap: tap, enable: true) }
+                    RuntimeLog.warning("cg-event", "CGEvent tap disabled type=\(type.rawValue); re-enabled immediately")
                     return Unmanaged.passUnretained(event)
                 }
                 guard type == .scrollWheel else { return Unmanaged.passUnretained(event) }
@@ -176,31 +178,37 @@ final class CGEventMonitor {
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
+            RuntimeLog.error("cg-event", "CGEvent tap creation failed suppressionEnabled=\(suppressionEnabled)")
             throw CGEventMonitorError.tapCreationFailed
         }
 
         guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
             CFMachPortInvalidate(tap)
+            RuntimeLog.error("cg-event", "CGEvent run-loop source creation failed")
             throw CGEventMonitorError.tapCreationFailed
         }
         self.tap = tap
         self.source = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        RuntimeLog.info("cg-event", "CGEvent tap registered, scheduled and enabled suppressionEnabled=\(suppressionEnabled)")
     }
 
     func setSuppressionEnabled(_ enabled: Bool) throws {
         guard enabled != suppressionEnabled || tap == nil else { return }
+        RuntimeLog.notice("cg-event", "Rebuilding CGEvent tap suppressionEnabled=\(enabled)")
         stop()
         do {
             try start(suppressionEnabled: enabled)
         } catch {
+            RuntimeLog.error("cg-event", "CGEvent tap rebuild failed suppressionEnabled=\(enabled) error=\(error.localizedDescription)")
             if enabled { try? start(suppressionEnabled: false) }
             throw error
         }
     }
 
     func stop() {
+        let wasStarted = source != nil || tap != nil
         if let source {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
             self.source = nil
@@ -208,6 +216,9 @@ final class CGEventMonitor {
         if let tap {
             CFMachPortInvalidate(tap)
             self.tap = nil
+        }
+        if wasStarted {
+            RuntimeLog.info("cg-event", "Stopped CGEvent monitor and invalidated tap")
         }
     }
 

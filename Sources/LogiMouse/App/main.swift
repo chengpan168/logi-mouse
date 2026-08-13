@@ -34,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var managerWindow: MouseManagerWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        RuntimeLog.notice("application", "Application launched logFile=\(RuntimeLog.fileURL.path)")
         let controller = MouseManagerWindowController()
         managerWindow = controller
         controller.showWindow(nil)
@@ -64,7 +65,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // This is the last safety boundary for hardware mode restoration.
         // Command-Q and the application menu's Quit command converge here;
         // closing the control window intentionally does not stop the service.
+        RuntimeLog.notice("application", "Application will terminate")
         managerWindow?.prepareForTermination()
+        RuntimeLog.notice("application", "Application termination cleanup completed")
     }
 }
 

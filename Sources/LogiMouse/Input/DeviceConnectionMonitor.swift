@@ -101,9 +101,16 @@ final class DeviceConnectionMonitor {
     private(set) var connection: MouseConnection = .disconnected
 
     func start() {
-        guard notificationPort == nil,
-              let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
+        guard notificationPort == nil else {
+            RuntimeLog.debug("device-registry", "IORegistry connection monitor already started")
+            return
+        }
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else {
+            RuntimeLog.error("device-registry", "Failed to create IOKit notification port")
+            return
+        }
         notificationPort = port
+        RuntimeLog.info("device-registry", "Created IOKit notification port serviceClass=\(Self.registryServiceClass)")
 
         // IOKit delivers first-match and terminated iterators through this run
         // loop source; callbacks do not open the device or receive input data.
@@ -111,7 +118,7 @@ final class DeviceConnectionMonitor {
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
 
         let context = Unmanaged.passUnretained(self).toOpaque()
-        IOServiceAddMatchingNotification(
+        let firstMatchResult = IOServiceAddMatchingNotification(
             port,
             kIOFirstMatchNotification,
             IOServiceMatching(Self.registryServiceClass),
@@ -124,7 +131,7 @@ final class DeviceConnectionMonitor {
             context,
             &firstMatchIterator
         )
-        IOServiceAddMatchingNotification(
+        let terminatedResult = IOServiceAddMatchingNotification(
             port,
             kIOTerminatedNotification,
             IOServiceMatching(Self.registryServiceClass),
@@ -138,13 +145,31 @@ final class DeviceConnectionMonitor {
             &terminatedIterator
         )
 
+        if firstMatchResult == KERN_SUCCESS {
+            RuntimeLog.info("device-registry", "Registered first-match notification result=0x00000000")
+        } else {
+            RuntimeLog.error(
+                "device-registry",
+                String(format: "First-match notification registration failed result=0x%08x", firstMatchResult)
+            )
+        }
+        if terminatedResult == KERN_SUCCESS {
+            RuntimeLog.info("device-registry", "Registered terminated notification result=0x00000000")
+        } else {
+            RuntimeLog.error(
+                "device-registry",
+                String(format: "Terminated notification registration failed result=0x%08x", terminatedResult)
+            )
+        }
+
         // Registration returns an iterator containing all devices that already
         // exist. It must be drained once to arm future notifications.
-        consume(iterator: firstMatchIterator, arrived: true)
-        consume(iterator: terminatedIterator, arrived: false)
+        if firstMatchIterator != 0 { consume(iterator: firstMatchIterator, arrived: true) }
+        if terminatedIterator != 0 { consume(iterator: terminatedIterator, arrived: false) }
     }
 
     func stop() {
+        let wasStarted = notificationPort != nil
         if firstMatchIterator != 0 {
             IOObjectRelease(firstMatchIterator)
             firstMatchIterator = 0
@@ -161,32 +186,72 @@ final class DeviceConnectionMonitor {
         }
         devices.removeAll()
         publishIfChanged(.disconnected)
+        if wasStarted {
+            RuntimeLog.info("device-registry", "Stopped IORegistry connection monitor and released notifications")
+        }
     }
 
     private func consume(iterator: io_iterator_t, arrived: Bool) {
         // Iterators are edge-triggered queues and must be drained completely.
         // Leaving one service unread prevents reliable delivery of later edges.
+        var consumedCount = 0
+        var relevantCount = 0
         while true {
             let service = IOIteratorNext(iterator)
             guard service != 0 else { break }
             defer { IOObjectRelease(service) }
+            consumedCount += 1
 
             var registryID: UInt64 = 0
-            guard IORegistryEntryGetRegistryEntryID(service, &registryID) == KERN_SUCCESS else {
+            let registryResult = IORegistryEntryGetRegistryEntryID(service, &registryID)
+            guard registryResult == KERN_SUCCESS else {
+                RuntimeLog.warning(
+                    "device-registry",
+                    String(format: "Failed to read registry ID arrived=%@ result=0x%08x", arrived.description, registryResult)
+                )
                 continue
             }
             if arrived, let device = Self.readDevice(service, registryID: registryID) {
                 devices[registryID] = device
+                relevantCount += 1
+                RuntimeLog.notice(
+                    "device-registry",
+                    String(
+                        format: "Device arrived registryID=%llu product=%@ transport=%@ vid=0x%04x pid=0x%04x usagePage=0x%04x usage=0x%04x",
+                        registryID,
+                        device.product,
+                        device.transport,
+                        device.vendorID,
+                        device.productID,
+                        device.primaryUsagePage,
+                        device.primaryUsage
+                    )
+                )
             } else if !arrived {
-                devices.removeValue(forKey: registryID)
+                if let device = devices.removeValue(forKey: registryID) {
+                    relevantCount += 1
+                    RuntimeLog.notice(
+                        "device-registry",
+                        "Device terminated registryID=\(registryID) product=\(device.product) transport=\(device.transport)"
+                    )
+                }
             }
         }
+        RuntimeLog.debug(
+            "device-registry",
+            "Drained notification arrived=\(arrived) services=\(consumedCount) relevant=\(relevantCount) tracked=\(devices.count)"
+        )
         publishIfChanged(MouseConnectionResolver.resolve(Array(devices.values)))
     }
 
     private func publishIfChanged(_ newConnection: MouseConnection) {
         guard connection != newConnection else { return }
+        let previous = connection
         connection = newConnection
+        RuntimeLog.notice(
+            "device-registry",
+            "Connection changed from=\(String(describing: previous)) to=\(String(describing: newConnection))"
+        )
         DispatchQueue.main.async { [weak self] in
             self?.onConnectionChange?(newConnection)
         }

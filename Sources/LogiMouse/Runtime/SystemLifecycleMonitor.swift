@@ -13,13 +13,20 @@ final class SystemLifecycleMonitor {
     private var observers: [NSObjectProtocol] = []
 
     func start() {
-        guard observers.isEmpty else { return }
+        guard observers.isEmpty else {
+            RuntimeLog.debug("lifecycle", "Power notification observers already registered")
+            return
+        }
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(
             forName: NSWorkspace.willSleepNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            RuntimeLog.notice(
+                "lifecycle",
+                "Received NSWorkspace.willSleepNotification thread=\(Thread.isMainThread ? "main" : "background") observers=\(self?.observers.count ?? 0)"
+            )
             self?.onWillSleep?()
         })
         observers.append(center.addObserver(
@@ -27,18 +34,25 @@ final class SystemLifecycleMonitor {
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            RuntimeLog.notice(
+                "lifecycle",
+                "Received NSWorkspace.didWakeNotification thread=\(Thread.isMainThread ? "main" : "background") observers=\(self?.observers.count ?? 0)"
+            )
             self?.onDidWake?()
         })
+        RuntimeLog.info("lifecycle", "Registered macOS sleep/wake notification observers count=\(observers.count)")
     }
 
     func stop() {
+        guard !observers.isEmpty else { return }
         let center = NSWorkspace.shared.notificationCenter
+        let count = observers.count
         for observer in observers { center.removeObserver(observer) }
         observers.removeAll()
+        RuntimeLog.info("lifecycle", "Unregistered macOS sleep/wake notification observers count=\(count)")
     }
 
     deinit {
         stop()
     }
 }
-

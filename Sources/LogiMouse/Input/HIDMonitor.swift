@@ -1,7 +1,6 @@
 import Foundation
 import HIDReportBridge
 import IOKit.hid
-import os
 
 private final class HIDDeviceCallbackContext {
     /// Weak to avoid a retain cycle: HIDMonitor owns the subscription, the
@@ -90,8 +89,6 @@ final class HIDMonitor {
     /// Logitech vendor usage pair that identifies HID++ inside the BLE descriptor.
     private static let bluetoothUsagePage = 0xff43
     private static let bluetoothUsage = 0x0202
-    private static let logger = Logger(subsystem: "dev.logi-mouse", category: "hid-input")
-
     private final class RawReportSubscription {
         /// Retaining IOHIDDevice keeps the callback target alive until unregister.
         let device: IOHIDDevice
@@ -165,16 +162,20 @@ final class HIDMonitor {
     }
 
     func start() throws {
+        RuntimeLog.info("hid-input", "Starting HID monitor")
         // Listening to raw HID input is protected by macOS Input Monitoring.
         // Requesting access is asynchronous: after the user changes the toggle,
         // the process must be restarted before IOHIDManagerOpen can succeed.
         switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
         case kIOHIDAccessTypeGranted:
+            RuntimeLog.info("hid-input", "Input Monitoring permission granted")
             break
         case kIOHIDAccessTypeDenied:
+            RuntimeLog.error("hid-input", "Input Monitoring permission denied")
             throw HIDMonitorError.permissionDenied
         default:
             _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+            RuntimeLog.warning("hid-input", "Input Monitoring permission pending; requested access")
             throw HIDMonitorError.permissionPending
         }
 
@@ -202,19 +203,28 @@ final class HIDMonitor {
             ])
         }
         IOHIDManagerSetDeviceMatchingMultiple(manager, matching as CFArray)
+        RuntimeLog.info("hid-input", "Configured HID matching dictionaries count=\(matching.count)")
 
         IOHIDManagerRegisterDeviceMatchingCallback(
             manager,
             { context, result, _, device in
-                guard let context, result == kIOReturnSuccess else { return }
+                guard let context else { return }
+                guard result == kIOReturnSuccess else {
+                    RuntimeLog.error("hid-input", String(format: "HID device matching callback failed result=0x%08x", result))
+                    return
+                }
                 Unmanaged<HIDMonitor>.fromOpaque(context).takeUnretainedValue().deviceMatched(device)
             },
             Unmanaged.passUnretained(self).toOpaque()
         )
         IOHIDManagerRegisterDeviceRemovalCallback(
             manager,
-            { context, _, _, device in
+            { context, result, _, device in
                 guard let context else { return }
+                guard result == kIOReturnSuccess else {
+                    RuntimeLog.error("hid-input", String(format: "HID device removal callback failed result=0x%08x", result))
+                    return
+                }
                 Unmanaged<HIDMonitor>.fromOpaque(context).takeUnretainedValue().deviceRemoved(device)
             },
             Unmanaged.passUnretained(self).toOpaque()
@@ -223,13 +233,16 @@ final class HIDMonitor {
         // report is timestamped in the kernel before this scheduling hop, so
         // model timing uses the hardware timestamp rather than callback time.
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        RuntimeLog.info("hid-input", "Registered HID match/removal callbacks and scheduled manager on main run loop")
 
         let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         guard result == kIOReturnSuccess else {
+            RuntimeLog.error("hid-input", String(format: "IOHIDManagerOpen failed result=0x%08x", result))
             stop()
             throw HIDMonitorError.managerOpenFailed(result)
         }
         managerIsOpen = true
+        RuntimeLog.info("hid-input", "IOHIDManager opened successfully")
         activatePendingDevices()
     }
 
@@ -248,7 +261,14 @@ final class HIDMonitor {
     }
 
     private func teardown(restoringHardware: Bool) {
-        guard let manager else { return }
+        guard let manager else {
+            RuntimeLog.debug("hid-input", "HID monitor teardown skipped because manager is not active")
+            return
+        }
+        RuntimeLog.notice(
+            "hid-input",
+            "Tearing down HID monitor restoringHardware=\(restoringHardware) subscriptions=\(reportSubscriptions.count) pendingDevices=\(pendingDevices.count)"
+        )
         if restoringHardware {
             // Restore hardware before unregistering the report callback: restore
             // requests need their 0x11 replies to wake HIDPPController.call().
@@ -264,6 +284,7 @@ final class HIDMonitor {
         IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         self.manager = nil
+        RuntimeLog.info("hid-input", "HID monitor teardown completed restoringHardware=\(restoringHardware)")
     }
 
     fileprivate func receiveFilteredReport(
@@ -281,6 +302,10 @@ final class HIDMonitor {
         ) {
             // The USB interface itself remains present while the paired mouse
             // is off. Report 0x10/sub-ID 0x41 is the actual radio-link signal.
+            RuntimeLog.notice(
+                "hid-input",
+                String(format: "Receiver link event key=0x%llx event=%@", deviceKey, String(describing: event))
+            )
             controller.observeReceiverConnection(deviceKey: deviceKey, event: event)
             return
         }
@@ -364,7 +389,18 @@ final class HIDMonitor {
             return
         }
         let key = Self.deviceKey(device)
-        Self.logger.info("Matched HID++ device on \(transportName, privacy: .public)")
+        RuntimeLog.notice(
+            "hid-input",
+            String(
+                format: "Matched HID++ device key=0x%llx transport=%@ vid=0x%04x pid=0x%04x usagePage=0x%04x usage=0x%04x",
+                key,
+                transportName,
+                vendorID ?? 0,
+                productID ?? 0,
+                usagePage ?? 0,
+                usage ?? 0
+            )
+        )
         pendingDevices[key] = PendingDevice(device: device, transport: transport)
         if managerIsOpen { activatePendingDevices() }
     }
@@ -374,6 +410,7 @@ final class HIDMonitor {
     /// USB and Bluetooth use the same activation order.
     private func activatePendingDevices() {
         guard managerIsOpen else { return }
+        RuntimeLog.info("hid-input", "Activating pending HID++ devices count=\(pendingDevices.count)")
         var activatedKeys: [UInt] = []
         for (key, pending) in pendingDevices {
             installRawReportSubscription(device: pending.device, key: key)
@@ -387,6 +424,7 @@ final class HIDMonitor {
         // Remove the controller route before freeing the callback context so a
         // concurrent late report cannot be accepted as the active transport.
         let key = Self.deviceKey(device)
+        RuntimeLog.notice("hid-input", String(format: "HID++ device removed key=0x%llx", key))
         pendingDevices.removeValue(forKey: key)
         controller.removeDevice(key: key)
         removeSubscription(key: key)
@@ -420,7 +458,10 @@ final class HIDMonitor {
             LMHIDPPFilteredReportCallback,
             Unmanaged.passUnretained(context).toOpaque()
         )
-        Self.logger.info("Raw HID++ report path active")
+        RuntimeLog.info(
+            "hid-input",
+            String(format: "Registered raw HID++ report callback key=0x%llx capacity=%d", key, capacity)
+        )
     }
 
     private func removeSubscription(key: UInt) {
@@ -434,6 +475,7 @@ final class HIDMonitor {
                 nil,
                 nil
             )
+            RuntimeLog.info("hid-input", String(format: "Unregistered raw HID++ report callback key=0x%llx", key))
         }
     }
 

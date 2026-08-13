@@ -315,7 +315,25 @@ export LOGI_MOUSE_NOTARY_PROFILE='logi-mouse-notary'
 
 应用提供标准的 `Quit logi-mouse` 菜单项；点击菜单或按 `Command-Q` 都会先执行同步模式恢复，再结束进程。
 
+平滑滚动开关和“自然滚动 / 标准滚动”方向会写入当前用户配置。再次启动时应用先恢复方向，并在 HID++ 设备通道就绪后自动恢复平滑滚动；如果鼠标尚未连接或处于休眠，保存的开启意图会继续等待后续设备事件，不需要重新手动打开。
+
 平滑滚动默认关闭。主界面不包含采集或诊断控件。
+
+### 运行日志
+
+应用会把低频运行日志同时写入 macOS Unified Logging 和以下文本文件：
+
+```text
+~/Library/Logs/LogiMouse/logi-mouse.log
+```
+
+日志覆盖应用启停、系统休眠/唤醒通知、runtime 状态迁移和 generation、唤醒重试、IORegistry 设备事件注册、设备到达/移除、HID manager 与 raw-report callback 注册/注销、Receiver 链路事件、CGEvent tap 启停及失败返回码。每个状态机事件都有递增 `sequence`，并记录 `BEGIN`、reducer 处理前后的完整状态、产生的 effects、每个 effect 的开始/结束以及最终状态。休眠与唤醒使用独立 `power` 边界日志，并记录从 will-sleep 到 did-wake 的时间和监听器释放/重建阶段。高频滚轮报告不会逐条写盘。日志达到 5 MB 后自动轮转，上一份保存在同目录的 `logi-mouse.previous.log`。
+
+实时查看：
+
+```bash
+tail -f ~/Library/Logs/LogiMouse/logi-mouse.log
+```
 
 ### 后台进程架构
 

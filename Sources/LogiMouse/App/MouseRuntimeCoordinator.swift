@@ -36,6 +36,8 @@ final class MouseRuntimeCoordinator {
     private var eventMonitor: CGEventMonitor?
     private var wakeRetryWorkItem: DispatchWorkItem?
     private var takeoverRecoveryInFlight = false
+    private var eventSequence: UInt64 = 0
+    private var sleepBeganAt: Date?
 
     private var verticalModel = ScrollDynamicsModel()
     private var horizontalModel = ScrollDynamicsModel()
@@ -45,10 +47,10 @@ final class MouseRuntimeCoordinator {
 
     init() {
         systemLifecycleMonitor.onWillSleep = { [weak self] in
-            self?.handleLifecycleEvent(.systemWillSleep)
+            self?.handleSystemWillSleep()
         }
         systemLifecycleMonitor.onDidWake = { [weak self] in
-            self?.handleLifecycleEvent(.systemDidWake)
+            self?.handleSystemDidWake()
         }
     }
 
@@ -190,10 +192,39 @@ final class MouseRuntimeCoordinator {
 
     // MARK: - State machine
 
+    private func handleSystemWillSleep() {
+        sleepBeganAt = Date()
+        RuntimeLog.notice(
+            "power",
+            "========== SYSTEM WILL SLEEP | before={\(runtimeDiagnosticSnapshot)} =========="
+        )
+        handleLifecycleEvent(.systemWillSleep)
+        RuntimeLog.notice(
+            "power",
+            "========== SYSTEM SUSPEND HANDLING FINISHED | after={\(runtimeDiagnosticSnapshot)} =========="
+        )
+    }
+
+    private func handleSystemDidWake() {
+        let now = Date()
+        let sleepDuration = sleepBeganAt.map { now.timeIntervalSince($0) }
+        RuntimeLog.notice(
+            "power",
+            "========== SYSTEM DID WAKE | elapsedSinceWillSleepSeconds=\(sleepDuration.map { String(format: "%.3f", $0) } ?? "unknown") before={\(runtimeDiagnosticSnapshot)} =========="
+        )
+        handleLifecycleEvent(.systemDidWake)
+        RuntimeLog.notice(
+            "power",
+            "========== SYSTEM WAKE HANDLING SCHEDULED | after={\(runtimeDiagnosticSnapshot)} =========="
+        )
+        sleepBeganAt = nil
+    }
+
     private func handleLifecycleEvent(_ event: MouseRuntimeEvent) {
         do {
             try send(event)
         } catch {
+            RuntimeLog.error("runtime", "Lifecycle event failed event=\(String(describing: event)) error=\(error.localizedDescription)")
             onStatusChange?(error.localizedDescription)
         }
     }
@@ -202,23 +233,66 @@ final class MouseRuntimeCoordinator {
     /// returned effects in order. Effects report completion by sending another
     /// event; no effect mutates `runtimeState` directly.
     private func send(_ event: MouseRuntimeEvent) throws {
+        eventSequence &+= 1
+        let sequence = eventSequence
+        let eventName = String(describing: event)
         let previous = runtimeState
+        RuntimeLog.info(
+            "state-machine",
+            "BEGIN sequence=\(sequence) event=\(eventName) before={\(runtimeDiagnosticSnapshot)}"
+        )
         let effects = reducer.reduce(state: &runtimeState, event: event)
+        let effectsDescription = effects.isEmpty
+            ? "[]"
+            : "[\(effects.map { String(describing: $0) }.joined(separator: ", "))]"
         if runtimeState != previous {
+            RuntimeLog.notice(
+                "state-machine",
+                "REDUCED sequence=\(sequence) changed=true event=\(eventName) effects=\(effectsDescription) "
+                    + "before={\(previous.diagnosticDescription)} after={\(runtimeState.diagnosticDescription)}"
+            )
             onRuntimeStateChange?(runtimeState)
+        } else {
+            RuntimeLog.debug(
+                "state-machine",
+                "REDUCED sequence=\(sequence) changed=false event=\(eventName) effects=\(effectsDescription) "
+                    + "before={\(previous.diagnosticDescription)} after={\(runtimeState.diagnosticDescription)}"
+            )
         }
         for effect in effects {
+            RuntimeLog.info(
+                "state-machine",
+                "EFFECT-BEGIN sequence=\(sequence) effect=\(String(describing: effect)) state={\(runtimeDiagnosticSnapshot)}"
+            )
             try execute(effect)
+            RuntimeLog.info(
+                "state-machine",
+                "EFFECT-END sequence=\(sequence) effect=\(String(describing: effect)) state={\(runtimeDiagnosticSnapshot)}"
+            )
         }
+        RuntimeLog.info(
+            "state-machine",
+            "END sequence=\(sequence) event=\(eventName) after={\(runtimeDiagnosticSnapshot)}"
+        )
+    }
+
+    private var runtimeDiagnosticSnapshot: String {
+        runtimeState.diagnosticDescription
+            + " liveModelEnabled=\(isLiveModelEnabled)"
+            + " globalOutputEnabled=\(isGlobalOutputEnabled)"
+            + " monitors={lifecycle:true,connection:\(connectionMonitor != nil),hid:\(hidMonitor != nil),cgEvent:\(eventMonitor != nil)}"
+            + " work={wakeTimer:\(wakeRetryWorkItem != nil),takeoverRecovery:\(takeoverRecoveryInFlight)}"
     }
 
     private func execute(_ effect: MouseRuntimeEffect) throws {
         switch effect {
         case let .startMonitoring(generation):
             do {
+                RuntimeLog.info("runtime", "Starting runtime monitors generation=\(generation)")
                 try startRuntimeMonitors(generation: generation)
                 try send(.monitoringStarted(generation: generation))
             } catch {
+                RuntimeLog.error("runtime", "Runtime monitor start failed generation=\(generation) error=\(error.localizedDescription)")
                 try? send(.monitoringStartFailed(
                     message: error.localizedDescription,
                     generation: generation
@@ -227,6 +301,7 @@ final class MouseRuntimeCoordinator {
             }
 
         case let .suspendMonitoring(generation):
+            RuntimeLog.notice("runtime", "Suspending runtime monitors generation=\(generation)")
             cancelScheduledWork()
             stopRuntimeMonitors(restoringHardware: false)
             resetModelsAndCorrelation()
@@ -234,13 +309,16 @@ final class MouseRuntimeCoordinator {
             onStatusChange?("系统已睡眠，鼠标监听已安全挂起")
 
         case let .scheduleWakeStart(attempt, generation, delay):
+            RuntimeLog.notice("runtime", "Scheduling wake rebuild generation=\(generation) attempt=\(attempt) delaySeconds=\(delay)")
             wakeRetryWorkItem?.cancel()
             let item = DispatchWorkItem { [weak self] in
                 guard let self else { return }
-                try? self.send(.wakeRetryTimerFired(
-                    attempt: attempt,
-                    generation: generation
-                ))
+                RuntimeLog.info("runtime", "Wake rebuild timer fired generation=\(generation) attempt=\(attempt)")
+                do {
+                    try self.send(.wakeRetryTimerFired(attempt: attempt, generation: generation))
+                } catch {
+                    RuntimeLog.error("runtime", "Wake rebuild failed generation=\(generation) attempt=\(attempt) error=\(error.localizedDescription)")
+                }
             }
             wakeRetryWorkItem = item
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
@@ -250,6 +328,7 @@ final class MouseRuntimeCoordinator {
             recoverTakeover(attempt: attempt, generation: generation)
 
         case let .stopMonitoring(generation):
+            RuntimeLog.notice("runtime", "Stopping runtime monitors generation=\(generation) restoringHardware=true")
             cancelScheduledWork()
             stopRuntimeMonitors(restoringHardware: true)
             try send(.monitoringStopped(generation: generation))
@@ -276,19 +355,36 @@ final class MouseRuntimeCoordinator {
         self.connectionMonitor = connectionMonitor
         self.hidMonitor = hidMonitor
         self.eventMonitor = eventMonitor
+        RuntimeLog.info("runtime", "Monitor rebuild stage=connection-start generation=\(generation)")
         connectionMonitor.start()
         do {
+            RuntimeLog.info("runtime", "Monitor rebuild stage=hid-start generation=\(generation)")
             try hidMonitor.start()
+            RuntimeLog.info("runtime", "Monitor rebuild stage=cg-event-start generation=\(generation) suppressionEnabled=\(isLiveModelEnabled)")
             try eventMonitor.start(suppressionEnabled: isLiveModelEnabled)
+            RuntimeLog.info("runtime", "All runtime monitors started generation=\(generation)")
         } catch {
+            RuntimeLog.error("runtime", "Partial monitor startup rolled back generation=\(generation) error=\(error.localizedDescription)")
             stopRuntimeMonitors(restoringHardware: false)
             throw error
         }
     }
 
     private func stopRuntimeMonitors(restoringHardware: Bool) {
+        RuntimeLog.info(
+            "runtime",
+            "Releasing runtime monitors restoringHardware=\(restoringHardware) cgEvent=\(eventMonitor != nil) connection=\(connectionMonitor != nil) hid=\(hidMonitor != nil)"
+        )
+        if eventMonitor != nil { RuntimeLog.info("runtime", "Monitor teardown stage=cg-event-stop") }
         eventMonitor?.stop()
+        if connectionMonitor != nil { RuntimeLog.info("runtime", "Monitor teardown stage=connection-stop") }
         connectionMonitor?.stop()
+        if hidMonitor != nil {
+            RuntimeLog.info(
+                "runtime",
+                "Monitor teardown stage=hid-\(restoringHardware ? "stop-and-restore" : "suspend-without-write")"
+            )
+        }
         if restoringHardware {
             hidMonitor?.stop()
         } else {
@@ -297,6 +393,10 @@ final class MouseRuntimeCoordinator {
         eventMonitor = nil
         connectionMonitor = nil
         hidMonitor = nil
+        RuntimeLog.info(
+            "runtime",
+            "Runtime monitor release completed restoringHardware=\(restoringHardware) cgEvent=false connection=false hid=false"
+        )
     }
 
     private func wire(
@@ -361,7 +461,14 @@ final class MouseRuntimeCoordinator {
               runtimeState.takeoverRequested,
               runtimeState.isRunning,
               !takeoverRecoveryInFlight,
-              let hidMonitor else { return }
+              let hidMonitor else {
+            RuntimeLog.debug(
+                "runtime",
+                "Takeover recovery skipped generation=\(generation) attempt=\(attempt) currentGeneration=\(runtimeState.generation) requested=\(runtimeState.takeoverRequested) running=\(runtimeState.isRunning) inFlight=\(takeoverRecoveryInFlight) hidAvailable=\(self.hidMonitor != nil)"
+            )
+            return
+        }
+        RuntimeLog.notice("runtime", "Starting takeover recovery generation=\(generation) attempt=\(attempt)")
         takeoverRecoveryInFlight = true
         try? send(.takeoverStarted(generation: generation))
         onStatusChange?("设备通道已就绪，正在恢复鼠标接管…")
@@ -372,9 +479,11 @@ final class MouseRuntimeCoordinator {
             self.takeoverRecoveryInFlight = false
             switch result {
             case .success:
+                RuntimeLog.notice("runtime", "Takeover recovery succeeded generation=\(generation) attempt=\(attempt)")
                 try? self.send(.takeoverSucceeded(generation: generation))
                 self.onStatusChange?("平滑滚动已恢复")
             case let .failure(error):
+                RuntimeLog.error("runtime", "Takeover recovery failed generation=\(generation) attempt=\(attempt) error=\(error.localizedDescription)")
                 try? self.send(.takeoverFailed(
                     message: error.localizedDescription,
                     recoveryAttempt: attempt,
@@ -386,6 +495,12 @@ final class MouseRuntimeCoordinator {
     }
 
     private func cancelScheduledWork() {
+        if wakeRetryWorkItem != nil || takeoverRecoveryInFlight {
+            RuntimeLog.info(
+                "runtime",
+                "Cancelling scheduled runtime work wakeTimer=\(wakeRetryWorkItem != nil) takeoverRecovery=\(takeoverRecoveryInFlight)"
+            )
+        }
         wakeRetryWorkItem?.cancel()
         wakeRetryWorkItem = nil
         takeoverRecoveryInFlight = false

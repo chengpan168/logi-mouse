@@ -62,4 +62,49 @@ struct MouseRuntimeState: Equatable, Sendable {
         case .horizontal: verifiedAxes.horizontal
         }
     }
+
+    /// Stable, field-by-field representation used by operational logs. Avoid
+    /// relying on Swift's synthesized enum formatting for postmortem analysis.
+    var diagnosticDescription: String {
+        let transport = selectedTransport?.description ?? "none"
+        return "generation=\(generation)"
+            + " lifecycle=\(lifecycle.diagnosticDescription)"
+            + " device=\(device.diagnosticDescription)"
+            + " selectedTransport=\(transport)"
+            + " takeoverRequested=\(takeoverRequested)"
+            + " verifiedAxes={vertical:\(verifiedAxes.vertical),horizontal:\(verifiedAxes.horizontal)}"
+            + " outputVerified={vertical:\(outputIsVerified(for: .vertical)),horizontal:\(outputIsVerified(for: .horizontal))}"
+    }
+}
+
+private extension MouseRuntimeLifecycleState {
+    var diagnosticDescription: String {
+        switch self {
+        case .stopped: "stopped"
+        case .starting: "starting"
+        case .running: "running"
+        case .suspending: "suspending"
+        case .suspended: "suspended"
+        case let .waking(attempt): "waking(attempt:\(attempt))"
+        case .stopping: "stopping"
+        case let .failed(message): "failed(message:\(message.debugDescription))"
+        }
+    }
+}
+
+private extension MouseRuntimeDeviceState {
+    var diagnosticDescription: String {
+        switch self {
+        case .absent: "absent"
+        case let .channelReady(transport): "channelReady(transport:\(transport))"
+        case let .deviceReady(transport): "deviceReady(transport:\(transport))"
+        case let .discovering(transport): "discovering(transport:\(transport?.description ?? "none"))"
+        case let .configuring(transport): "configuring(transport:\(transport?.description ?? "none"))"
+        case let .ready(transport): "ready(transport:\(transport?.description ?? "none"))"
+        case let .verifying(transport): "verifying(transport:\(transport?.description ?? "none"))"
+        case let .restoring(transport): "restoring(transport:\(transport?.description ?? "none"))"
+        case let .failed(message): "failed(message:\(message.debugDescription))"
+        case let .waitingForEvent(message): "waitingForEvent(message:\(message.debugDescription))"
+        }
+    }
 }
