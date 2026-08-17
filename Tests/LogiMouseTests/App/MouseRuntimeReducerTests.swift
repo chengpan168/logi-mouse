@@ -128,7 +128,7 @@ import Testing
     #expect(state.takeoverRequested)
 }
 
-@Test func failedRecoveryWaitsForAnotherDeviceReadyEvent() {
+@Test func failedRecoveryRetriesAfterOneTwoAndThreeSecondsThenWaitsForEvent() {
     var reducer = MouseRuntimeReducer()
     var state = MouseRuntimeState(
         lifecycle: .running,
@@ -138,13 +138,50 @@ import Testing
         selectedTransport: .usbReceiver
     )
 
-    let effects = reducer.reduce(
+    var effects = reducer.reduce(
         state: &state,
         event: .takeoverFailed(message: "timeout", recoveryAttempt: 1, generation: 3)
+    )
+    #expect(effects == [.scheduleTakeoverRecovery(attempt: 2, generation: 3, delay: 1)])
+    #expect(state.device == .failed("timeout"))
+
+    effects = reducer.reduce(
+        state: &state,
+        event: .takeoverFailed(message: "timeout", recoveryAttempt: 2, generation: 3)
+    )
+    #expect(effects == [.scheduleTakeoverRecovery(attempt: 3, generation: 3, delay: 2)])
+
+    effects = reducer.reduce(
+        state: &state,
+        event: .takeoverFailed(message: "timeout", recoveryAttempt: 3, generation: 3)
+    )
+    #expect(effects == [.scheduleTakeoverRecovery(attempt: 4, generation: 3, delay: 3)])
+
+    effects = reducer.reduce(
+        state: &state,
+        event: .takeoverFailed(message: "timeout", recoveryAttempt: 4, generation: 3)
     )
     #expect(effects.isEmpty)
     #expect(state.device == .waitingForEvent("timeout"))
     #expect(state.takeoverRequested)
+}
+
+@Test func takeoverRetryTimerNeverDependsOnWheelInput() {
+    var reducer = MouseRuntimeReducer()
+    var state = MouseRuntimeState(
+        lifecycle: .running,
+        device: .failed("timeout"),
+        takeoverRequested: true,
+        generation: 3,
+        selectedTransport: .usbReceiver
+    )
+
+    let effects = reducer.reduce(
+        state: &state,
+        event: .takeoverRetryTimerFired(attempt: 2, generation: 3)
+    )
+
+    #expect(effects == [.recoverTakeover(attempt: 2, generation: 3)])
 }
 
 @Test func outputRequiresRunningReadyIntentAndVerifiedAxis() {

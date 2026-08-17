@@ -144,7 +144,7 @@ NSWorkspace.didWake
 → verifiedAxes 完整后恢复输出
 ```
 
-监听重建失败时按 `0.5s / 1s / 2s` 的节奏最多尝试三次。接管失败也采用有限重试，达到上限后进入 `waitingForEvent`，等待 Bluetooth interface 匹配或 Receiver `0x41` 连接通知，不做无限轮询。
+监听重建失败时按 `0.5s / 1s / 2s` 的节奏最多尝试三次。唤醒后的首次接管失败后再按 `1s / 2s / 3s` 延迟重试三次；达到上限后进入 `waitingForEvent`，只等待 Bluetooth interface 匹配或 Receiver `0x41` 连接通知，不做无限轮询，也绝不由普通主滚轮或拇指滚轮报告触发控制请求。
 
 如果设备事件先完成自动恢复，两轴校验成功会取消尚未触发的接管重试，避免重复硬件事务。
 

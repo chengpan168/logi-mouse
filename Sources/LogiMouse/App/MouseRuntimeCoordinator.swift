@@ -35,6 +35,7 @@ final class MouseRuntimeCoordinator {
     private var hidMonitor: HIDMonitor?
     private var eventMonitor: CGEventMonitor?
     private var wakeRetryWorkItem: DispatchWorkItem?
+    private var takeoverRetryWorkItem: DispatchWorkItem?
     private var takeoverRecoveryInFlight = false
     private var eventSequence: UInt64 = 0
     private var sleepBeganAt: Date?
@@ -281,7 +282,7 @@ final class MouseRuntimeCoordinator {
             + " liveModelEnabled=\(isLiveModelEnabled)"
             + " globalOutputEnabled=\(isGlobalOutputEnabled)"
             + " monitors={lifecycle:true,connection:\(connectionMonitor != nil),hid:\(hidMonitor != nil),cgEvent:\(eventMonitor != nil)}"
-            + " work={wakeTimer:\(wakeRetryWorkItem != nil),takeoverRecovery:\(takeoverRecoveryInFlight)}"
+            + " work={wakeTimer:\(wakeRetryWorkItem != nil),takeoverRetryTimer:\(takeoverRetryWorkItem != nil),takeoverRecovery:\(takeoverRecoveryInFlight)}"
     }
 
     private func execute(_ effect: MouseRuntimeEffect) throws {
@@ -313,6 +314,7 @@ final class MouseRuntimeCoordinator {
             wakeRetryWorkItem?.cancel()
             let item = DispatchWorkItem { [weak self] in
                 guard let self else { return }
+                self.wakeRetryWorkItem = nil
                 RuntimeLog.info("runtime", "Wake rebuild timer fired generation=\(generation) attempt=\(attempt)")
                 do {
                     try self.send(.wakeRetryTimerFired(attempt: attempt, generation: generation))
@@ -323,6 +325,35 @@ final class MouseRuntimeCoordinator {
             wakeRetryWorkItem = item
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
             onStatusChange?("系统已唤醒，等待 HID 服务恢复…")
+
+        case let .scheduleTakeoverRecovery(attempt, generation, delay):
+            RuntimeLog.notice(
+                "runtime",
+                "Scheduling takeover recovery generation=\(generation) attempt=\(attempt) delaySeconds=\(delay)"
+            )
+            takeoverRetryWorkItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.takeoverRetryWorkItem = nil
+                RuntimeLog.info(
+                    "runtime",
+                    "Takeover recovery timer fired generation=\(generation) attempt=\(attempt)"
+                )
+                do {
+                    try self.send(.takeoverRetryTimerFired(
+                        attempt: attempt,
+                        generation: generation
+                    ))
+                } catch {
+                    RuntimeLog.error(
+                        "runtime",
+                        "Scheduled takeover recovery failed generation=\(generation) attempt=\(attempt) error=\(error.localizedDescription)"
+                    )
+                }
+            }
+            takeoverRetryWorkItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+            onStatusChange?("恢复失败，\(Int(delay)) 秒后重试（第 \(attempt) 次）…")
 
         case let .recoverTakeover(attempt, generation):
             recoverTakeover(attempt: attempt, generation: generation)
@@ -469,6 +500,8 @@ final class MouseRuntimeCoordinator {
             return
         }
         RuntimeLog.notice("runtime", "Starting takeover recovery generation=\(generation) attempt=\(attempt)")
+        takeoverRetryWorkItem?.cancel()
+        takeoverRetryWorkItem = nil
         takeoverRecoveryInFlight = true
         try? send(.takeoverStarted(generation: generation))
         onStatusChange?("设备通道已就绪，正在恢复鼠标接管…")
@@ -489,20 +522,24 @@ final class MouseRuntimeCoordinator {
                     recoveryAttempt: attempt,
                     generation: generation
                 ))
-                self.onStatusChange?("恢复失败，等待设备通道再次就绪：\(error.localizedDescription)")
+                if attempt > MouseRuntimeReducer.takeoverRecoveryRetryDelays.count {
+                    self.onStatusChange?("恢复重试已耗尽，等待设备重新连接：\(error.localizedDescription)")
+                }
             }
         }
     }
 
     private func cancelScheduledWork() {
-        if wakeRetryWorkItem != nil || takeoverRecoveryInFlight {
+        if wakeRetryWorkItem != nil || takeoverRetryWorkItem != nil || takeoverRecoveryInFlight {
             RuntimeLog.info(
                 "runtime",
-                "Cancelling scheduled runtime work wakeTimer=\(wakeRetryWorkItem != nil) takeoverRecovery=\(takeoverRecoveryInFlight)"
+                "Cancelling scheduled runtime work wakeTimer=\(wakeRetryWorkItem != nil) takeoverRetryTimer=\(takeoverRetryWorkItem != nil) takeoverRecovery=\(takeoverRecoveryInFlight)"
             )
         }
         wakeRetryWorkItem?.cancel()
         wakeRetryWorkItem = nil
+        takeoverRetryWorkItem?.cancel()
+        takeoverRetryWorkItem = nil
         takeoverRecoveryInFlight = false
     }
 

@@ -458,7 +458,7 @@ Bluetooth IOHIDInterface 生命周期 / Receiver 0x10/0x41 链路通知
 - 主界面根据 Bluetooth interface 生命周期和 Receiver 链路通知显示 USB Receiver、Bluetooth 或未连接；新设备到达会自动纳入监听。
 - Bluetooth 已接入 `0xff43/0x0202`、直连索引 `0xff` 和动态 feature 发现，并通过 C bridge 过滤复合接口中的普通指针报告。
 - `0x2121`/`0x2150` 接管、模式漂移恢复、睡眠唤醒、退出时原生恢复，以及两种传输的慢速和快速滚动手感均已真机验证。
-- 最新重连实现已经移除失败后的循环扫描并通过自动化测试；Bluetooth 到达和 Receiver `0x10/0x41` 通知触发单次恢复，仍需完成最后一轮断开/重连真机确认。
+- 最新重连实现不会无限扫描：唤醒接管失败后按 `1s / 2s / 3s` 有限重试，耗尽后仅由 Bluetooth 到达或 Receiver `0x10/0x41` 通知触发单次恢复；普通滚轮报告绝不触发控制请求。该路径仍需完成最后一轮断开/重连真机确认。
 - Live model 已支持显式全局输出，但当前仍以前台 App 形式运行，尚未产品化为登录项或菜单栏后台服务。
 - SmartShift、DPI、按键映射和手势等 Options+ 功能不在当前范围内。
 

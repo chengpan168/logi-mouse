@@ -108,7 +108,21 @@ final class HIDPPRequestSession {
         pendingRequest = nil
         condition.unlock()
 
-        guard let response else { throw HIDPPControllerError.timeout }
+        guard let response else {
+            log(
+                "hidpp_request_timeout",
+                String(
+                    format: "device=%u feature=0x%02x function=%u swid=%u payload=%@ timeout=%.3f",
+                    deviceIndex,
+                    featureIndex,
+                    functionID,
+                    header.softwareID,
+                    payload.map { String(format: "%02x", $0) }.joined(),
+                    timeout
+                )
+            )
+            throw HIDPPControllerError.timeout
+        }
         if let error = HIDPPProtocol.errorCode(in: response) {
             throw HIDPPControllerError.deviceError(error)
         }

@@ -135,6 +135,13 @@ final class HIDMonitor {
         controller.onBatteryStateChange = { [weak self] state in
             self?.onBatteryStateChange?(state)
         }
+        controller.onLog = { layer, message in
+            if layer.contains("failed") || layer.contains("exhausted") || layer.contains("timeout") {
+                RuntimeLog.warning("hidpp", "layer=\(layer) \(message)")
+            } else {
+                RuntimeLog.debug("hidpp", "layer=\(layer) \(message)")
+            }
+        }
     }
 
     func takeOverWheel(

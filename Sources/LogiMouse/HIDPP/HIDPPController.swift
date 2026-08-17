@@ -690,7 +690,8 @@ final class HIDPPController {
         // Prefer a slot learned from Receiver 0x41 or an earlier wheel event.
         // Event-driven reconnect normally has this route and avoids scanning.
         // A user-initiated takeover may still scan 1...6 once when no route is
-        // known; failed recovery never schedules another scan by itself.
+        // known. The controller never loops on its own; the application-level
+        // wake policy may explicitly request a bounded sequence of retries.
         var candidates: [UInt8] = []
         if let preferred { candidates.append(preferred) }
         if !knownRouteOnly || preferred == nil {
@@ -986,8 +987,9 @@ final class HIDPPController {
     // MARK: - Event-driven verification and reconnect
 
     /// Schedules at most one recovery for one device lifecycle event. Failure
-    /// intentionally does not recurse; the next BLE arrival, Receiver 0x41
-    /// notification or explicit window-open verification is required.
+    /// intentionally does not recurse; outside the bounded application-level
+    /// wake retry policy, the next BLE arrival, Receiver 0x41 notification or
+    /// explicit window-open verification is required.
     private func scheduleReacquire(after delay: TimeInterval) {
         operationQueue.async { [weak self] in
             guard let self, !self.reacquireAttemptScheduled else { return }

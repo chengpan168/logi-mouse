@@ -11,6 +11,7 @@ enum MouseRuntimeEvent: Sendable {
     case monitoringSuspended(generation: UInt64)
     case systemDidWake
     case wakeRetryTimerFired(attempt: Int, generation: UInt64)
+    case takeoverRetryTimerFired(attempt: Int, generation: UInt64)
     case stopRequested
     case monitoringStopped(generation: UInt64)
 
@@ -34,12 +35,15 @@ enum MouseRuntimeEffect: Equatable, Sendable {
     case startMonitoring(generation: UInt64)
     case suspendMonitoring(generation: UInt64)
     case scheduleWakeStart(attempt: Int, generation: UInt64, delay: TimeInterval)
+    case scheduleTakeoverRecovery(attempt: Int, generation: UInt64, delay: TimeInterval)
     case recoverTakeover(attempt: Int, generation: UInt64)
     case stopMonitoring(generation: UInt64)
 }
 
 struct MouseRuntimeReducer {
     static let recoveryDelays: [TimeInterval] = [0.5, 1.0, 2.0]
+    /// Delays for the three retries after the initial wake takeover attempt.
+    static let takeoverRecoveryRetryDelays: [TimeInterval] = [1.0, 2.0, 3.0]
 
     mutating func reduce(
         state: inout MouseRuntimeState,
@@ -120,6 +124,12 @@ struct MouseRuntimeReducer {
                   state.lifecycle == .waking(attempt: attempt) else { return [] }
             return [.startMonitoring(generation: generation)]
 
+        case let .takeoverRetryTimerFired(attempt, generation):
+            guard generation == state.generation,
+                  state.lifecycle == .running,
+                  state.takeoverRequested else { return [] }
+            return [.recoverTakeover(attempt: attempt, generation: generation)]
+
         case .stopRequested:
             guard state.lifecycle != .stopped,
                   state.lifecycle != .stopping else { return [] }
@@ -164,11 +174,23 @@ struct MouseRuntimeReducer {
         case let .takeoverFailed(message, recoveryAttempt, generation):
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
             state.verifiedAxes = .none
-            state.device = .failed(message)
-            if recoveryAttempt != nil {
-                state.device = .waitingForEvent(message)
+            guard let recoveryAttempt else {
+                state.device = .failed(message)
+                return []
             }
-            return []
+            let retryIndex = recoveryAttempt - 1
+            guard retryIndex >= 0,
+                  retryIndex < Self.takeoverRecoveryRetryDelays.count,
+                  state.takeoverRequested else {
+                state.device = .waitingForEvent(message)
+                return []
+            }
+            state.device = .failed(message)
+            return [.scheduleTakeoverRecovery(
+                attempt: recoveryAttempt + 1,
+                generation: generation,
+                delay: Self.takeoverRecoveryRetryDelays[retryIndex]
+            )]
 
         case let .verificationStarted(generation):
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
