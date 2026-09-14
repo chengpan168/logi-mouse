@@ -12,15 +12,108 @@ import Testing
     #expect(!HIDPPProtocol.isLongInputReport(0x02))
 }
 
-@Test func decodesReceiverConnectionLifecycleNotification() {
-    let connected: [UInt8] = [0x10, 0x02, 0x41, 0x04, 0x21, 0x34, 0x12]
-    let disconnected: [UInt8] = [0x10, 0x02, 0x41, 0x04, 0x61, 0x34, 0x12]
+@Test func decodesReceiverConnectionAndDisconnectionNotifications() {
+    let connected: [UInt8] = [0x10, 0x02, 0x41, 0x04, 0x22, 0x34, 0x12]
+    let linkNotEstablished: [UInt8] = [0x10, 0x02, 0x41, 0x04, 0x62, 0x34, 0x12]
+    let keyboard: [UInt8] = [0x10, 0x03, 0x41, 0x04, 0x21, 0x78, 0x56]
+    let disconnected: [UInt8] = [0x10, 0x02, 0x40, 0x02, 0x00, 0x00, 0x00]
 
-    #expect(HIDPPProtocol.receiverConnectionEvent(reportID: 0x10, bytes: connected)
-        == .init(deviceIndex: 2, isConnected: true))
-    #expect(HIDPPProtocol.receiverConnectionEvent(reportID: 0x10, bytes: disconnected)
-        == .init(deviceIndex: 2, isConnected: false))
+    let connection = HIDPPProtocol.receiverConnectionEvent(reportID: 0x10, bytes: connected)
+    let unavailable = HIDPPProtocol.receiverConnectionEvent(
+        reportID: 0x10,
+        bytes: linkNotEstablished
+    )
+    let keyboardConnection = HIDPPProtocol.receiverConnectionEvent(
+        reportID: 0x10,
+        bytes: keyboard
+    )
+    let disconnection = HIDPPProtocol.receiverConnectionEvent(
+        reportID: 0x10,
+        bytes: disconnected
+    )
+
+    #expect(connection?.deviceIndex == 2)
+    #expect(connection?.isConnected == true)
+    #expect(connection?.notificationSubID == 0x41)
+    #expect(connection?.deviceType == 0x02)
+    #expect(connection?.isPotentialPointingDevice == true)
+    #expect(unavailable?.isConnected == false)
+    #expect(keyboardConnection?.deviceType == 0x01)
+    #expect(keyboardConnection?.isPotentialPointingDevice == false)
+    #expect(disconnection?.deviceIndex == 2)
+    #expect(disconnection?.isConnected == false)
+    #expect(disconnection?.notificationSubID == 0x40)
+    #expect(disconnection?.detail == 0x02)
     #expect(HIDPPProtocol.receiverConnectionEvent(reportID: 0x11, bytes: connected) == nil)
+}
+
+@Test func receiverConnectionEdgesIgnoreRepeatedStatesAndReopenAfterDisconnect() {
+    var tracker = ReceiverConnectionEdgeTracker()
+
+    let firstOnline = tracker.accept(deviceIndex: 1, connected: true)
+    let duplicateOnline = tracker.accept(deviceIndex: 1, connected: true)
+    let secondDuplicateOnline = tracker.accept(deviceIndex: 1, connected: true)
+    let offline = tracker.accept(deviceIndex: 1, connected: false)
+    let duplicateOffline = tracker.accept(deviceIndex: 1, connected: false)
+    let onlineAfterOffline = tracker.accept(deviceIndex: 1, connected: true)
+    #expect(firstOnline)
+    #expect(!duplicateOnline)
+    #expect(!secondDuplicateOnline)
+    #expect(offline)
+    #expect(!duplicateOffline)
+    #expect(onlineAfterOffline)
+
+    // Slots are independent; another paired device must not consume the
+    // target slot's online edge.
+    let secondSlotOnline = tracker.accept(deviceIndex: 2, connected: true)
+    let secondSlotDuplicate = tracker.accept(deviceIndex: 2, connected: true)
+    #expect(secondSlotOnline)
+    #expect(!secondSlotDuplicate)
+
+    tracker.reset()
+    let onlineAfterReset = tracker.accept(deviceIndex: 1, connected: true)
+    #expect(onlineAfterReset)
+}
+
+@Test func buildsAndMatchesReceiverNotificationRegisterRequests() {
+    let getHeader = HIDPPProtocol.ShortRegisterRequestHeader(
+        deviceIndex: 0xff,
+        subID: 0x81,
+        address: 0x00
+    )
+    let getRequest = HIDPPProtocol.makeShortRegisterRequest(
+        header: getHeader,
+        parameters: [0, 0, 0]
+    )
+    let getResponse: [UInt8] = [0x10, 0xff, 0x81, 0x00, 0x10, 0x08, 0x20]
+    let getError: [UInt8] = [0x10, 0xff, 0x8f, 0x81, 0x00, 0x02, 0x00]
+
+    #expect(getRequest == [0x10, 0xff, 0x81, 0x00, 0x00, 0x00, 0x00])
+    #expect(HIDPPProtocol.matchesResponse(getResponse, request: getHeader))
+    #expect(HIDPPProtocol.matchesResponse(getError, request: getHeader))
+    #expect(HIDPPProtocol.shortRegisterErrorCode(in: getError) == 0x02)
+
+    let setHeader = HIDPPProtocol.ShortRegisterRequestHeader(
+        deviceIndex: 0xff,
+        subID: 0x80,
+        address: 0x00
+    )
+    let setRequest = HIDPPProtocol.makeShortRegisterRequest(
+        header: setHeader,
+        parameters: [0x10, 0x09, 0x20]
+    )
+    #expect(setRequest == [0x10, 0xff, 0x80, 0x00, 0x10, 0x09, 0x20])
+    #expect(!HIDPPProtocol.matchesResponse(getResponse, request: setHeader))
+}
+
+@Test func preservesReceiverNotificationFlagsWhenEnablingWirelessEvents() {
+    let response: [UInt8] = [0x10, 0xff, 0x81, 0x00, 0x10, 0x08, 0x20]
+    let initial = HIDPPProtocol.receiverNotificationFlags(in: response)
+    let enabled = initial?.enablingWirelessNotifications
+
+    #expect(initial?.wirelessNotificationsEnabled == false)
+    #expect(enabled?.parameters == [0x10, 0x09, 0x20])
+    #expect(enabled?.wirelessNotificationsEnabled == true)
 }
 
 @Test func buildsRootFeatureDiscoveryRequest() {

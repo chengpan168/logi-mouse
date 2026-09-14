@@ -68,6 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RuntimeLog.notice("application", "Application will terminate")
         managerWindow?.prepareForTermination()
         RuntimeLog.notice("application", "Application termination cleanup completed")
+        RuntimeLog.flush()
     }
 }
 

@@ -26,6 +26,35 @@ import Testing
     #expect(effects == [.suspendMonitoring(generation: 8)])
 }
 
+@Test func interruptedInitialTakeoverRegainsOutputAfterWakeAndHonorsDisable() {
+    var reducer = MouseRuntimeReducer()
+    var state = MouseRuntimeState(
+        lifecycle: .running,
+        device: .configuring(.bluetooth),
+        takeoverRequested: true,
+        generation: 7,
+        selectedTransport: .bluetooth
+    )
+    #expect(!state.outputIsVerified(for: .vertical))
+    _ = reducer.reduce(state: &state, event: .systemWillSleep)
+    _ = reducer.reduce(state: &state, event: .monitoringSuspended(generation: 8))
+    _ = reducer.reduce(state: &state, event: .systemDidWake)
+    _ = reducer.reduce(state: &state, event: .monitoringStarted(generation: 9))
+    _ = reducer.reduce(state: &state, event: .controllerState(.deviceReady(.bluetooth), generation: 9))
+    _ = reducer.reduce(state: &state, event: .takeoverStarted(generation: 9))
+    _ = reducer.reduce(state: &state, event: .takeoverAxesChanged(
+        HIDPPTakeoverAxes(vertical: true, horizontal: true), generation: 9
+    ))
+    #expect(!state.outputIsVerified(for: .vertical))
+    _ = reducer.reduce(state: &state, event: .takeoverSucceeded(generation: 9))
+    #expect(state.outputIsVerified(for: .vertical))
+    #expect(state.outputIsVerified(for: .horizontal))
+
+    _ = reducer.reduce(state: &state, event: .takeoverIntentChanged(false))
+    #expect(!state.outputIsVerified(for: .vertical))
+    #expect(!state.outputIsVerified(for: .horizontal))
+}
+
 @Test func wakeWaitsForDeviceReadyBeforeRecoveringRequestedTakeover() {
     var reducer = MouseRuntimeReducer()
     var state = MouseRuntimeState(
@@ -79,6 +108,58 @@ import Testing
 
     #expect(state.device == .deviceReady(.bluetooth))
     #expect(effects == [.recoverTakeover(attempt: 1, generation: 6)])
+}
+
+@Test func duplicateDeviceReadyPreservesVerifiedTakeover() {
+    var reducer = MouseRuntimeReducer()
+    var state = MouseRuntimeState(
+        lifecycle: .running,
+        device: .ready(.usbReceiver),
+        takeoverRequested: true,
+        verifiedAxes: HIDPPTakeoverAxes(vertical: true, horizontal: true),
+        generation: 12,
+        selectedTransport: .usbReceiver
+    )
+    let before = state
+
+    let effects = reducer.reduce(
+        state: &state,
+        event: .controllerState(.deviceReady(.usbReceiver), generation: 12)
+    )
+
+    #expect(effects.isEmpty)
+    #expect(state == before)
+}
+
+@Test func duplicateDeviceReadyDoesNotInterruptInFlightTakeover() {
+    var reducer = MouseRuntimeReducer()
+    let phases: [MouseRuntimeDeviceState] = [
+        .deviceReady(.usbReceiver),
+        .discovering(.usbReceiver),
+        .configuring(.usbReceiver),
+        .verifying(.usbReceiver),
+        .restoring(.usbReceiver),
+    ]
+
+    for phase in phases {
+        var state = MouseRuntimeState(
+            lifecycle: .running,
+            device: phase,
+            takeoverRequested: true,
+            verifiedAxes: HIDPPTakeoverAxes(vertical: true, horizontal: false),
+            generation: 13,
+            selectedTransport: .usbReceiver
+        )
+        let before = state
+
+        let effects = reducer.reduce(
+            state: &state,
+            event: .controllerState(.deviceReady(.usbReceiver), generation: 13)
+        )
+
+        #expect(effects.isEmpty)
+        #expect(state == before)
+    }
 }
 
 @Test func callbacksFromAnOldGenerationCannotReviveAStaleDevice() {

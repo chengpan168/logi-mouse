@@ -37,19 +37,52 @@ final class HIDPPDeviceServiceCoordinator {
         onReady: @escaping (HIDPPReadyDevice, Int) -> Void,
         onLog: @escaping (String, String) -> Void
     ) {
-        guard attempt < Self.readinessProbeDelays.count else { return }
+        guard attempt < Self.readinessProbeDelays.count else {
+            onLog(
+                "hidpp_readiness_probe_rejected",
+                "route_generation=\(generation) attempt=\(attempt + 1) reason=attempt-out-of-range"
+            )
+            return
+        }
         lock.lock()
-        guard deviceReadyGeneration != generation,
-              readinessProbeScheduledGeneration != generation else {
+        let alreadyReady = deviceReadyGeneration == generation
+        let alreadyScheduled = readinessProbeScheduledGeneration == generation
+        guard !alreadyReady, !alreadyScheduled else {
             lock.unlock()
+            onLog(
+                "hidpp_readiness_probe_deduplicated",
+                "route_generation=\(generation) attempt=\(attempt + 1) "
+                    + "already_ready=\(alreadyReady) already_scheduled=\(alreadyScheduled)"
+            )
             return
         }
         readinessProbeScheduledGeneration = generation
         lock.unlock()
 
         let delay = Self.readinessProbeDelays[attempt]
+        onLog(
+            "hidpp_readiness_probe_scheduled",
+            "route_generation=\(generation) attempt=\(attempt + 1)/\(Self.readinessProbeDelays.count) "
+                + "delay=\(delay)"
+        )
         operationQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
+            self.lock.lock()
+            let readyBeforeOperation = self.deviceReadyGeneration == generation
+            self.lock.unlock()
+            guard isCurrent(generation), !readyBeforeOperation else {
+                self.lock.lock()
+                if self.readinessProbeScheduledGeneration == generation {
+                    self.readinessProbeScheduledGeneration = nil
+                }
+                self.lock.unlock()
+                onLog("hidpp_readiness_probe_discarded", "route_generation=\(generation) before_operation=true")
+                return
+            }
+            onLog(
+                "hidpp_readiness_probe_started",
+                "route_generation=\(generation) attempt=\(attempt + 1)/\(Self.readinessProbeDelays.count)"
+            )
             let result = Result { try operation() }
 
             self.lock.lock()
@@ -59,22 +92,41 @@ final class HIDPPDeviceServiceCoordinator {
             let alreadyReady = self.deviceReadyGeneration == generation
             self.lock.unlock()
 
-            guard isCurrent(generation), !alreadyReady else { return }
+            let current = isCurrent(generation)
+            guard current, !alreadyReady else {
+                onLog(
+                    "hidpp_readiness_probe_discarded",
+                    "route_generation=\(generation) attempt=\(attempt + 1) "
+                        + "route_current=\(current) already_ready=\(alreadyReady)"
+                )
+                return
+            }
             switch result {
             case let .success(device):
                 self.markDeviceReady(generation: generation)
+                onLog(
+                    "hidpp_readiness_probe_succeeded",
+                    "route_generation=\(generation) attempt=\(attempt + 1) "
+                        + "device=\(device.deviceIndex) transport=\(device.transport)"
+                )
                 onReady(device, attempt + 1)
 
             case let .failure(error):
                 let nextAttempt = attempt + 1
                 guard nextAttempt < Self.readinessProbeDelays.count else {
-                    onLog("hidpp_readiness_probe_exhausted", error.localizedDescription)
+                    onLog(
+                        "hidpp_readiness_probe_exhausted",
+                        "route_generation=\(generation) attempts=\(Self.readinessProbeDelays.count) "
+                            + "error=\(error.localizedDescription)"
+                    )
                     return
                 }
                 let nextDelay = Self.readinessProbeDelays[nextAttempt]
                 onLog(
                     "hidpp_readiness_probe_retry",
-                    "attempt=\(nextAttempt + 1) delay=\(nextDelay) error=\(error.localizedDescription)"
+                    "route_generation=\(generation) completed_attempt=\(attempt + 1) "
+                        + "next_attempt=\(nextAttempt + 1) delay=\(nextDelay) "
+                        + "error=\(error.localizedDescription)"
                 )
                 self.probeReadiness(
                     generation: generation,
@@ -107,6 +159,15 @@ final class HIDPPDeviceServiceCoordinator {
         onState(.loading)
         operationQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
+            guard isCurrent(generation) else {
+                self.lock.lock()
+                if self.batteryRefreshScheduledGeneration == generation {
+                    self.batteryRefreshScheduledGeneration = nil
+                }
+                self.lock.unlock()
+                onLog("hidpp_battery_discarded", "route_generation=\(generation) before_operation=true")
+                return
+            }
             let result = Result { try operation() }
 
             self.lock.lock()

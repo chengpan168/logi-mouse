@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-/// Low-frequency operational logging for lifecycle and device diagnostics.
+/// Operational logging for lifecycle and device diagnostics.
 ///
 /// Every record is sent to macOS Unified Logging and appended to a plain-text
 /// file under `~/Library/Logs/LogiMouse`. The file is intentionally independent
@@ -36,7 +36,15 @@ enum RuntimeLog {
     }()
 
     private static let maximumFileSize: UInt64 = 5 * 1_024 * 1_024
-    private static let queue = DispatchQueue(label: "dev.logi-mouse.runtime-log")
+    private static let queueKey = DispatchSpecificKey<Void>()
+    private static let queue: DispatchQueue = {
+        let queue = DispatchQueue(
+            label: "dev.logi-mouse.runtime-log",
+            qos: .utility
+        )
+        queue.setSpecific(key: queueKey, value: ())
+        return queue
+    }()
 
     /// Formats file timestamps in the user's current system time zone and
     /// includes the numeric UTC offset so copied logs remain unambiguous.
@@ -70,14 +78,23 @@ enum RuntimeLog {
         write(.error, category: category, message: message())
     }
 
+    /// Waits until all records submitted before this call have reached the
+    /// file. Use only at lifecycle boundaries; normal input paths must never
+    /// wait for logging I/O.
+    static func flush() {
+        guard DispatchQueue.getSpecific(key: queueKey) == nil else { return }
+        queue.sync {}
+    }
+
     private static func write(_ level: Level, category: String, message: String) {
         let logger = Logger(subsystem: subsystem, category: category)
         logger.log(level: level.osLogType, "\(message, privacy: .public)")
 
-        // These records are deliberately synchronous and low frequency. This
-        // ensures the final pre-sleep record reaches disk before macOS suspends
-        // the process, while keeping high-rate HID reports off this path.
-        queue.sync {
+        // HID callbacks and the CGEvent tap share the application's main run
+        // loop. File opens and fsyncs here would stall input processing during
+        // a reconnect or recovery burst, so file I/O is always asynchronous.
+        let line = "\(timestamp(for: Date())) [\(level.rawValue)] [\(category)] \(message)\n"
+        queue.async {
             do {
                 try rotateIfNeeded()
                 let directory = fileURL.deletingLastPathComponent()
@@ -91,10 +108,8 @@ enum RuntimeLog {
                 let handle = try FileHandle(forWritingTo: fileURL)
                 defer { try? handle.close() }
                 try handle.seekToEnd()
-                let line = "\(timestamp(for: Date())) [\(level.rawValue)] [\(category)] \(message)\n"
                 if let data = line.data(using: .utf8) {
                     try handle.write(contentsOf: data)
-                    try handle.synchronize()
                 }
             } catch {
                 logger.error("Failed to append runtime log file: \(error.localizedDescription, privacy: .public)")

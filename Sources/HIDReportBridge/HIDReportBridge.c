@@ -1,10 +1,11 @@
 #include "HIDReportBridge.h"
 
-/// Stable C ABI exported by HIDMonitor.swift. `context` points to the Swift
-/// callback holder retained by RawReportSubscription for the entire callback
-/// registration lifetime; this function never takes ownership of it.
+/// Stable C ABI exported by HIDMonitor.swift. `context` points to the HIDMonitor
+/// retained by its manager for the entire callback lifetime; this function never
+/// takes ownership of it. `sender` is the IOHIDDevice that emitted the report.
 extern void LogiMouseReceiveHIDPPReport(
     void *context,
+    void *sender,
     uint32_t reportID,
     uint8_t *report,
     CFIndex reportLength,
@@ -49,6 +50,7 @@ void LMHIDPPFilteredReportCallback(
 
     LogiMouseReceiveHIDPPReport(
         context,
+        sender,
         reportID,
         report,
         reportLength,

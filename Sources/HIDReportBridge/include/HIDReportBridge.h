@@ -10,7 +10,7 @@ bool LMShouldForwardHIDReport(
     CFIndex reportLength
 );
 
-/// IOHID raw-report callback used by Swift.
+/// IOHID manager raw-report callback used by Swift.
 ///
 /// Hardware boundary:
 /// - USB Receiver exposes HID++ as a dedicated vendor interface. Its report
@@ -19,11 +19,12 @@ bool LMShouldForwardHIDReport(
 /// - Bluetooth exposes keyboard report 0x01, pointer report 0x02 and HID++
 ///   report 0x11 through one composite IOHIDDevice.
 ///
-/// IOHIDDevice input-report callbacks are registered for the whole device, not
-/// for one Report ID. macOS therefore wakes this C callback for every Bluetooth
-/// pointer movement. Rejecting 0x01/0x02 here prevents allocation, locking and
-/// Swift ARC work on that hot path. It cannot prevent the initial process wake,
-/// because Report ID filtering is unavailable below this callback in IOHIDLib.
+/// IOHID manager input-report callbacks are registered for every matched device,
+/// not for one Report ID. macOS therefore wakes this C callback for every
+/// Bluetooth pointer movement. Rejecting 0x01/0x02 here prevents allocation,
+/// locking and Swift ARC work on that hot path. The manager is scheduled on a
+/// dedicated serial dispatch queue, so this wake-up never occupies the app's
+/// main RunLoop.
 void LMHIDPPFilteredReportCallback(
     void * _Nullable context,
     IOReturn result,

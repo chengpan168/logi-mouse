@@ -147,6 +147,15 @@ struct MouseRuntimeReducer {
 
         case let .controllerState(controllerState, generation):
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
+            if case let .deviceReady(transport) = controllerState,
+               shouldIgnoreDuplicateDeviceReady(transport: transport, state: state) {
+                // Receiver 0x41 is an edge-triggered link signal in practice,
+                // but some firmware repeats it while the same mouse remains
+                // online. Do not clear verified axes or interrupt an in-flight
+                // takeover when the application is already handling this
+                // transport's readiness.
+                return []
+            }
             applyControllerState(controllerState, state: &state)
             if case .deviceReady = controllerState,
                state.takeoverRequested,
@@ -294,6 +303,26 @@ struct MouseRuntimeReducer {
         case let .failed(message):
             state.device = .failed(message)
             state.verifiedAxes = .none
+        }
+    }
+
+    private func shouldIgnoreDuplicateDeviceReady(
+        transport: HIDPPTransport,
+        state: MouseRuntimeState
+    ) -> Bool {
+        guard state.selectedTransport == transport else { return false }
+        switch state.device {
+        case .deviceReady, .discovering, .configuring, .verifying, .restoring:
+            // These phases already represent a readiness event being consumed
+            // or a transaction that must not be restarted by a duplicate edge.
+            return true
+        case .ready:
+            // A complete, verified takeover is already safe to keep running.
+            // If evidence is partial, accept the event so the normal recovery
+            // path can rebuild the missing axis.
+            return state.takeoverRequested && state.verifiedAxes.isComplete
+        default:
+            return false
         }
     }
 }

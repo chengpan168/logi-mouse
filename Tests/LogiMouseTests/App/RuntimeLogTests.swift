@@ -10,3 +10,9 @@ import Testing
             == "1970-01-01T08:00:00.000+08:00"
     )
 }
+
+@MainActor
+@Test func takeoverDiagnosticsUseSmallBoundedSamples() {
+    #expect(CGEventMonitor.diagnosticSampleLimit == 6)
+    #expect(MouseRuntimeCoordinator.modelDiagnosticSampleLimit == 4)
+}

@@ -13,6 +13,7 @@ enum HIDPPControllerError: LocalizedError, Equatable {
     case deviceError(UInt8)
     case unexpectedResponse
     case verificationFailed(expected: UInt8, actual: UInt8)
+    case receiverNotificationsNotEnabled(actual: UInt8)
 
     var errorDescription: String? {
         switch self {
@@ -34,7 +35,36 @@ enum HIDPPControllerError: LocalizedError, Equatable {
             "The HID++ device returned an unexpected response."
         case let .verificationFailed(expected, actual):
             String(format: "Wheel mode verification failed: expected 0x%02x, got 0x%02x.", expected, actual)
+        case let .receiverNotificationsNotEnabled(actual):
+            String(
+                format: "Receiver wireless notifications were not enabled after read-back (receiver flags 0x%02x).",
+                actual
+            )
         }
+    }
+}
+
+/// De-duplicates Receiver link notifications by slot and connection edge.
+///
+/// Receivers may emit multiple 0x41 reports while a mouse remains online (for
+/// example when link metadata changes). Treating each report as a fresh device
+/// arrival would restart the complete HID++ takeover transaction and compete
+/// with the mouse's input reports. The tracker is protected by the controller's
+/// `stateLock`; it is kept as a value type so the edge semantics stay directly
+/// unit-testable without constructing an IOHIDDevice.
+struct ReceiverConnectionEdgeTracker: Sendable {
+    private var states: [UInt8: Bool] = [:]
+
+    mutating func accept(deviceIndex: UInt8, connected: Bool) -> Bool {
+        if let previous = states[deviceIndex], previous == connected {
+            return false
+        }
+        states[deviceIndex] = connected
+        return true
+    }
+
+    mutating func reset() {
+        states.removeAll(keepingCapacity: false)
     }
 }
 
@@ -143,6 +173,9 @@ final class HIDPPController {
     private let stateLock = NSLock()
     private var channels: [UInt: Channel] = [:]
     private var selectedChannelKey: UInt?
+    /// Per-slot link edge state used to ignore repeated Receiver 0x41/0x40
+    /// notifications until an actual offline/online transition occurs.
+    private var receiverConnectionEdges = ReceiverConnectionEdgeTracker()
     /// Receiver slot seen in notifications/events; Bluetooth is always 0xff.
     private var observedDeviceIndex: UInt8?
     /// Per-device runtime addresses returned by Root Feature discovery.
@@ -175,6 +208,7 @@ final class HIDPPController {
         if channelChanged {
             resetRouteStateLocked(for: selected?.transport)
         }
+        let selectedRouteGeneration = routeGeneration
         stateLock.unlock()
 
         if channelChanged { publishTakeoverAxes(.none) }
@@ -183,7 +217,10 @@ final class HIDPPController {
         cancelPendingRequest()
         transition(to: .channelReady(selected.transport))
         log("hidpp_controller_device", "selected \(selected.transport) HID++ channel")
-        probeDeviceReadiness()
+        prepareSelectedChannel(
+            selected,
+            routeGeneration: selectedRouteGeneration
+        )
     }
 
     /// Removes a physical interface. If Bluetooth disappears while a Receiver
@@ -198,6 +235,7 @@ final class HIDPPController {
         }
         let replacement = selectedChannelLocked()
         if wasSelected { resetRouteStateLocked(for: replacement?.transport) }
+        let replacementRouteGeneration = routeGeneration
         stateLock.unlock()
 
         if wasSelected {
@@ -207,7 +245,10 @@ final class HIDPPController {
             if let replacement {
                 transition(to: .channelReady(replacement.transport))
                 log("hidpp_controller_device", "fell back to \(replacement.transport) HID++ channel")
-                probeDeviceReadiness()
+                prepareSelectedChannel(
+                    replacement,
+                    routeGeneration: replacementRouteGeneration
+                )
             } else {
                 transition(to: .unavailable)
                 log("hidpp_controller_device_removed", "active HID++ channel removed")
@@ -215,14 +256,17 @@ final class HIDPPController {
         }
     }
 
-    /// Accepts every complete HID++ 0x11 input before event decoding. Exact
-    /// replies wake `call`; ordinary wheel reports never trigger verification.
-    func observeReport(_ report: [UInt8]) {
-        guard report.count == HIDPPProtocol.longReportLength,
-              report.first == HIDPPProtocol.longReportID else { return }
-
+    /// Accepts HID++ 1.0 short and HID++ 2.0 long input before event decoding.
+    /// Exact replies wake the shared request session. Unsolicited notifications
+    /// never match unless their complete response header belongs to the pending
+    /// command, so Receiver lifecycle and wheel events remain asynchronous.
+    @discardableResult
+    func observeReport(_ report: [UInt8]) -> Bool {
         let matchedPendingRequest = requestSession.observe(report)
-        guard !matchedPendingRequest, report[3] == 0 else { return }
+        guard !matchedPendingRequest else { return true }
+        guard report.count == HIDPPProtocol.longReportLength,
+              report.first == HIDPPProtocol.longReportID,
+              report[3] == 0 else { return false }
         stateLock.lock()
         let batteryFeature = batteryFeatures[report[1]]
         stateLock.unlock()
@@ -231,13 +275,15 @@ final class HIDPPController {
               let battery = HIDPPProtocol.batteryInfo(
                   in: report,
                   feature: batteryFeature
-              ) else { return }
+              ) else { return false }
         publishBatteryState(.available(battery))
+        return false
     }
 
     /// Handles Receiver radio-link changes. The USB dongle's IOHIDInterface
-    /// does not disappear when the mouse powers off, so report 0x10/0x41 is the
-    /// authoritative online/offline signal for Receiver mode.
+    /// does not disappear when the mouse powers off, so reports 0x10/0x40 and
+    /// 0x10/0x41 are the authoritative offline/online signals. Events from a
+    /// keyboard or another unobserved slot must not invalidate the mouse route.
     func observeReceiverConnection(
         deviceKey: UInt,
         event: HIDPPProtocol.ReceiverConnectionEvent
@@ -245,12 +291,67 @@ final class HIDPPController {
         stateLock.lock()
         let isSelectedReceiver = selectedChannelKey == deviceKey
             && channels[deviceKey]?.transport == .usbReceiver
+        guard isSelectedReceiver else {
+            stateLock.unlock()
+            log(
+                "hidpp_receiver_event_ignored",
+                String(
+                    format: "slot=%u sub_id=0x%02x reason=non-selected-receiver",
+                    event.deviceIndex,
+                    event.notificationSubID
+                )
+            )
+            return
+        }
+        if event.isConnected, !event.isPotentialPointingDevice {
+            stateLock.unlock()
+            log(
+                "hidpp_receiver_event_ignored",
+                String(
+                    format: "slot=%u sub_id=0x%02x device_type=0x%02x reason=non-pointing-device",
+                    event.deviceIndex,
+                    event.notificationSubID,
+                    event.deviceType ?? 0xff
+                )
+            )
+            return
+        }
+        if !event.isConnected, observedDeviceIndex != event.deviceIndex {
+            let observed = observedDeviceIndex.map(String.init) ?? "none"
+            stateLock.unlock()
+            log(
+                "hidpp_receiver_event_ignored",
+                String(
+                    format: "slot=%u sub_id=0x%02x reason=not-observed-mouse observed_slot=%@",
+                    event.deviceIndex,
+                    event.notificationSubID,
+                    observed
+                )
+            )
+            return
+        }
+        guard receiverConnectionEdges.accept(
+            deviceIndex: event.deviceIndex,
+            connected: event.isConnected
+        ) else {
+            stateLock.unlock()
+            log(
+                "hidpp_receiver_event_ignored",
+                String(
+                    format: "slot=%u sub_id=0x%02x connected=%@ reason=duplicate-link-edge",
+                    event.deviceIndex,
+                    event.notificationSubID,
+                    event.isConnected ? "true" : "false"
+                )
+            )
+            return
+        }
         var readyGeneration: UInt64?
-        if isSelectedReceiver, event.isConnected {
+        if event.isConnected {
             observedDeviceIndex = event.deviceIndex
             readyGeneration = routeGeneration
         }
-        if isSelectedReceiver, !event.isConnected {
+        if !event.isConnected {
             activeWheel = nil
             activeThumbwheel = nil
             featureIndices.removeAll()
@@ -259,23 +360,42 @@ final class HIDPPController {
             verifiedTakeoverAxes = .none
             routeGeneration &+= 1
         }
+        let routeGenerationSnapshot = routeGeneration
         stateLock.unlock()
 
-        if isSelectedReceiver, !event.isConnected { publishTakeoverAxes(.none) }
+        if !event.isConnected { publishTakeoverAxes(.none) }
 
-        guard isSelectedReceiver else { return }
         if event.isConnected {
             if let readyGeneration {
                 deviceServices.markDeviceReady(generation: readyGeneration)
             }
-            log("hidpp_receiver_connected", "slot=\(event.deviceIndex)")
+            log(
+                "hidpp_receiver_connected",
+                String(
+                    format: "slot=%u sub_id=0x%02x device_type=0x%02x detail=0x%02x route_generation=%llu",
+                    event.deviceIndex,
+                    event.notificationSubID,
+                    event.deviceType ?? 0xff,
+                    event.detail,
+                    readyGeneration ?? 0
+                )
+            )
             transition(to: .deviceReady(.usbReceiver))
             refreshBattery(after: 0)
         } else {
             publishBatteryState(.unavailable)
             cancelPendingRequest()
             transition(to: .unavailable)
-            log("hidpp_receiver_disconnected", "slot=\(event.deviceIndex)")
+            log(
+                "hidpp_receiver_disconnected",
+                String(
+                    format: "slot=%u sub_id=0x%02x detail=0x%02x new_route_generation=%llu",
+                    event.deviceIndex,
+                    event.notificationSubID,
+                    event.detail,
+                    routeGenerationSnapshot
+                )
+            )
         }
     }
 
@@ -404,40 +524,20 @@ final class HIDPPController {
 
     /// Restores hardware before process termination.
     ///
-    /// When called from the main thread, the run loop must keep pumping because
-    /// IOHIDManager delivers the restore replies there. A plain semaphore wait
-    /// would deadlock until timeout and could leave the wheel diverted.
+    /// HIDMonitor delivers input reports on its dedicated HID dispatch queue,
+    /// so waiting for the serialized operation queue cannot block the callback
+    /// that completes a restore request. Keeping this synchronous makes teardown
+    /// deterministic without pumping the AppKit run loop and dispatching mouse
+    /// events while the application is stopping.
     func restoreSynchronously() {
         setTakeoverRequested(false)
-        if !Thread.isMainThread {
-            operationQueue.sync {
-                do {
-                    _ = try performRestore()
-                } catch {
-                    invalidateVerifiedTakeoverAxes()
-                    log("hidpp_restore_failed", error.localizedDescription)
-                }
-            }
-            return
-        }
-
-        // IOHIDManager callbacks are delivered on the main run loop. Pump it
-        // while the serialized controller queue restores and verifies the
-        // mode; blocking the main thread here would otherwise force a timeout.
-        let group = DispatchGroup()
-        group.enter()
-        operationQueue.async { [weak self] in
-            defer { group.leave() }
-            guard let self else { return }
+        operationQueue.sync {
             do {
                 _ = try self.performRestore()
             } catch {
-                self.invalidateVerifiedTakeoverAxes()
-                self.log("hidpp_restore_failed", error.localizedDescription)
+                invalidateVerifiedTakeoverAxes()
+                log("hidpp_restore_failed", error.localizedDescription)
             }
-        }
-        while group.wait(timeout: .now()) == .timedOut {
-            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
         }
     }
 
@@ -754,6 +854,143 @@ final class HIDPPController {
         return information
     }
 
+    // MARK: - Receiver notification subscription
+
+    /// Completes transport-specific preparation before readiness probing. The
+    /// raw input callback is already installed by HIDMonitor at this point, so
+    /// short-register replies and an early 0x40/0x41 notification cannot race
+    /// ahead of callback registration.
+    private func prepareSelectedChannel(
+        _ channel: Channel,
+        routeGeneration: UInt64
+    ) {
+        guard channel.transport == .usbReceiver else {
+            probeDeviceReadiness()
+            return
+        }
+
+        log(
+            "hidpp_receiver_notifications_prepare_scheduled",
+            String(
+                format: "route_generation=%llu channel_key=0x%llx",
+                routeGeneration,
+                channel.key
+            )
+        )
+        operationQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.selectedChannelIsCurrent(
+                key: channel.key,
+                generation: routeGeneration
+            ) else {
+                self.log(
+                    "hidpp_receiver_notifications_prepare_discarded",
+                    String(
+                        format: "route_generation=%llu channel_key=0x%llx reason=stale-route-before-start",
+                        routeGeneration,
+                        channel.key
+                    )
+                )
+                return
+            }
+
+            do {
+                try self.enableReceiverWirelessNotifications(device: channel.device)
+            } catch {
+                // Notification subscription improves event-driven recovery but
+                // is not a prerequisite for direct probing. Continue so older
+                // or unusual Receiver firmware retains the existing behavior.
+                self.log(
+                    "hidpp_receiver_notifications_enable_failed",
+                    "route_generation=\(routeGeneration) error=\(error.localizedDescription)"
+                )
+            }
+
+            guard self.selectedChannelIsCurrent(
+                key: channel.key,
+                generation: routeGeneration
+            ) else {
+                self.log(
+                    "hidpp_receiver_notifications_prepare_discarded",
+                    String(
+                        format: "route_generation=%llu channel_key=0x%llx reason=stale-route-after-configuration",
+                        routeGeneration,
+                        channel.key
+                    )
+                )
+                return
+            }
+            self.probeDeviceReadiness()
+        }
+    }
+
+    /// Enables Receiver register 0x00/r1 bit 0 with read-modify-write semantics.
+    /// Other applications may own adjacent notification bits, so their values
+    /// are preserved rather than replaced with a hard-coded flag set.
+    private func enableReceiverWirelessNotifications(device: IOHIDDevice) throws {
+        let initialResponse = try requestSession.sendShortRegister(
+            device: device,
+            subID: HIDPPProtocol.getShortRegisterSubID,
+            address: HIDPPProtocol.receiverNotificationRegister,
+            parameters: [0, 0, 0],
+            timeout: 0.7,
+            log: log
+        )
+        guard let initial = HIDPPProtocol.receiverNotificationFlags(in: initialResponse) else {
+            log(
+                "hidpp_receiver_notifications_read_invalid",
+                "raw=\(initialResponse.map { String(format: "%02x", $0) }.joined())"
+            )
+            throw HIDPPControllerError.unexpectedResponse
+        }
+        log("hidpp_receiver_notifications_read", "before={\(initial)}")
+
+        let desired = initial.enablingWirelessNotifications
+        if desired != initial {
+            log(
+                "hidpp_receiver_notifications_write_requested",
+                "before={\(initial)} desired={\(desired)} preserved_other_bits=true"
+            )
+            _ = try requestSession.sendShortRegister(
+                device: device,
+                subID: HIDPPProtocol.setShortRegisterSubID,
+                address: HIDPPProtocol.receiverNotificationRegister,
+                parameters: desired.parameters,
+                timeout: 0.7,
+                log: log
+            )
+            log("hidpp_receiver_notifications_write_acknowledged", "desired={\(desired)}")
+        } else {
+            log("hidpp_receiver_notifications_already_enabled", "flags={\(initial)}")
+        }
+
+        let verificationResponse = try requestSession.sendShortRegister(
+            device: device,
+            subID: HIDPPProtocol.getShortRegisterSubID,
+            address: HIDPPProtocol.receiverNotificationRegister,
+            parameters: [0, 0, 0],
+            timeout: 0.7,
+            log: log
+        )
+        guard let verified = HIDPPProtocol.receiverNotificationFlags(in: verificationResponse) else {
+            log(
+                "hidpp_receiver_notifications_verify_invalid",
+                "raw=\(verificationResponse.map { String(format: "%02x", $0) }.joined())"
+            )
+            throw HIDPPControllerError.unexpectedResponse
+        }
+        guard verified.wirelessNotificationsEnabled else {
+            log("hidpp_receiver_notifications_verify_failed", "after={\(verified)}")
+            throw HIDPPControllerError.receiverNotificationsNotEnabled(
+                actual: verified.receiverFlags
+            )
+        }
+        log(
+            "hidpp_receiver_notifications_verified",
+            "after={\(verified)} changed=\(initial != verified)"
+        )
+    }
+
     // MARK: - Device readiness
 
     /// Probes only the HID++ root/high-resolution-wheel control path. This is
@@ -761,12 +998,26 @@ final class HIDPPController {
     /// while battery is optional product information.
     private func probeDeviceReadiness() {
         stateLock.lock()
-        guard selectedChannelLocked() != nil else {
+        guard let selectedChannel = selectedChannelLocked() else {
             stateLock.unlock()
+            log(
+                "hidpp_readiness_probe_skipped",
+                "reason=no-selected-channel takeover_requested=\(isTakeoverRequested)"
+            )
             return
         }
         let generation = routeGeneration
+        let observedDeviceIndex = observedDeviceIndex
+        let requested = takeoverRequested
         stateLock.unlock()
+        let observedDeviceDescription = observedDeviceIndex.map(String.init) ?? "none"
+
+        log(
+            "hidpp_readiness_probe_requested",
+            "route_generation=\(generation) transport=\(selectedChannel.transport) "
+                + "observed_device=\(observedDeviceDescription) "
+                + "takeover_requested=\(requested)"
+        )
 
         deviceServices.probeReadiness(
             generation: generation,
@@ -790,7 +1041,21 @@ final class HIDPPController {
                 )
                 self.refreshBattery(after: 0, deviceIndex: device.deviceIndex)
             },
-            onLog: { [weak self] layer, message in self?.log(layer, message) }
+            onLog: { [weak self] layer, message in
+                guard let self else { return }
+                self.stateLock.lock()
+                let currentGeneration = self.routeGeneration
+                let transport = self.selectedChannelLocked()?.transport.description ?? "none"
+                let observedDevice = self.observedDeviceIndex.map(String.init) ?? "none"
+                let requested = self.takeoverRequested
+                self.stateLock.unlock()
+                self.log(
+                    layer,
+                    "\(message) current_route_generation=\(currentGeneration) "
+                        + "selected_transport=\(transport) observed_device=\(observedDevice) "
+                        + "takeover_requested=\(requested)"
+                )
+            }
         )
     }
 
@@ -1141,6 +1406,12 @@ final class HIDPPController {
         return generation == routeGeneration && selectedChannelLocked() != nil
     }
 
+    private func selectedChannelIsCurrent(key: UInt, generation: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return generation == routeGeneration && selectedChannelKey == key
+    }
+
     private func preferredChannelKeyLocked() -> UInt? {
         channels.values.max { lhs, rhs in
             if lhs.transport.selectionPriority == rhs.transport.selectionPriority {
@@ -1161,6 +1432,7 @@ final class HIDPPController {
     /// direct route is known up-front, while feature indices remain discoverable.
     private func resetRouteStateLocked(for transport: HIDPPTransport?) {
         observedDeviceIndex = transport?.directDeviceIndex
+        receiverConnectionEdges.reset()
         featureIndices.removeAll()
         thumbwheelFeatureIndices.removeAll()
         batteryFeatures.removeAll()

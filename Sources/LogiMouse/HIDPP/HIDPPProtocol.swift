@@ -50,8 +50,17 @@ enum HIDPPProtocol {
     /// Seven-byte HID++ 1.0 report used by a Receiver for link notifications.
     static let shortReportID: UInt8 = 0x10
     static let shortReportLength = 7
-    /// Sub-ID placed in byte 2 of report 0x10 for device connection changes.
+    /// Receiver notifications use separate Sub-IDs for departure and arrival.
+    static let receiverDisconnectionSubID: UInt8 = 0x40
     static let receiverConnectionSubID: UInt8 = 0x41
+    /// HID++ 1.0 short-register commands used to configure the Receiver itself.
+    static let setShortRegisterSubID: UInt8 = 0x80
+    static let getShortRegisterSubID: UInt8 = 0x81
+    static let shortErrorSubID: UInt8 = 0x8f
+    static let receiverDeviceIndex: UInt8 = 0xff
+    static let receiverNotificationRegister: UInt8 = 0x00
+    /// Register 0x00 byte r1 bit 0 enables 0x40/0x41 wireless notifications.
+    static let receiverWirelessNotificationMask: UInt8 = 0x01
 
     /// HID++ 2.0 long-report identifier and fixed wire length.
     static let longReportID: UInt8 = 0x11
@@ -76,10 +85,29 @@ enum HIDPPProtocol {
         let deviceIndex: UInt8
         /// True when the paired device's radio link is established/in range.
         let isConnected: Bool
+        /// 0x40 for departure or 0x41 for arrival/link information.
+        let notificationSubID: UInt8
+        /// Present on 0x41: low nibble of device-info (mouse is 0x02).
+        let deviceType: UInt8?
+        /// 0x40 disconnection reason or the complete 0x41 device-info byte.
+        let detail: UInt8
+
+        var isPotentialPointingDevice: Bool {
+            guard let deviceType else { return false }
+            // Unknown is retained for firmware compatibility; explicit
+            // keyboard, numpad and presenter events must not select a mouse route.
+            return deviceType == 0x00
+                || deviceType == 0x02
+                || deviceType == 0x08
+                || deviceType == 0x09
+        }
     }
 
-    /// HID++ 1.0 Receiver notification `10 <slot> 41 ...`.
-    /// Bit 6 of the device-info byte is the inverse link-status flag: zero
+    /// HID++ 1.0 Receiver notifications:
+    /// - `10 <slot> 40 <reason> 00 00 00` reports departure.
+    /// - `10 <slot> 41 <protocol> <device-info> <pid-lsb> <pid-msb>` reports arrival.
+    ///
+    /// For 0x41, bit 6 of device-info is the inverse link-status flag: zero
     /// means the paired device is in range and its wireless link is active.
     static func receiverConnectionEvent(
         reportID: UInt32,
@@ -89,13 +117,66 @@ enum HIDPPProtocol {
               bytes.count >= shortReportLength,
               bytes[0] == shortReportID,
               bytes[1] >= 1,
-              bytes[1] <= 6,
-              bytes[2] == receiverConnectionSubID else { return nil }
-        // HID++ defines bit 6 as "link not established", so zero is online.
-        return ReceiverConnectionEvent(
-            deviceIndex: bytes[1],
-            isConnected: bytes[4] & 0x40 == 0
-        )
+              bytes[1] <= 6 else { return nil }
+        switch bytes[2] {
+        case receiverDisconnectionSubID:
+            return ReceiverConnectionEvent(
+                deviceIndex: bytes[1],
+                isConnected: false,
+                notificationSubID: bytes[2],
+                deviceType: nil,
+                detail: bytes[3]
+            )
+        case receiverConnectionSubID:
+            // HID++ defines bit 6 as "link not established", so zero is online.
+            return ReceiverConnectionEvent(
+                deviceIndex: bytes[1],
+                isConnected: bytes[4] & 0x40 == 0,
+                notificationSubID: bytes[2],
+                deviceType: bytes[4] & 0x0f,
+                detail: bytes[4]
+            )
+        default:
+            return nil
+        }
+    }
+
+    struct ShortRegisterRequestHeader: Equatable, Sendable {
+        let deviceIndex: UInt8
+        let subID: UInt8
+        let address: UInt8
+    }
+
+    struct ReceiverNotificationFlags: Equatable, Sendable, CustomStringConvertible {
+        let deviceFlags: UInt8
+        let receiverFlags: UInt8
+        let continuedDeviceFlags: UInt8
+
+        var wirelessNotificationsEnabled: Bool {
+            receiverFlags & receiverWirelessNotificationMask != 0
+        }
+
+        var enablingWirelessNotifications: ReceiverNotificationFlags {
+            ReceiverNotificationFlags(
+                deviceFlags: deviceFlags,
+                receiverFlags: receiverFlags | receiverWirelessNotificationMask,
+                continuedDeviceFlags: continuedDeviceFlags
+            )
+        }
+
+        var parameters: [UInt8] {
+            [deviceFlags, receiverFlags, continuedDeviceFlags]
+        }
+
+        var description: String {
+            String(
+                format: "device=0x%02x receiver=0x%02x continued=0x%02x wireless=%@",
+                deviceFlags,
+                receiverFlags,
+                continuedDeviceFlags,
+                wirelessNotificationsEnabled ? "enabled" : "disabled"
+            )
+        }
     }
 
     struct RequestHeader: Equatable, Sendable {
@@ -235,6 +316,22 @@ enum HIDPPProtocol {
         return report
     }
 
+    static func makeShortRegisterRequest(
+        header: ShortRegisterRequestHeader,
+        parameters: [UInt8]
+    ) -> [UInt8] {
+        precondition(header.subID == setShortRegisterSubID || header.subID == getShortRegisterSubID)
+        precondition(parameters.count <= 3)
+
+        var report = [UInt8](repeating: 0, count: shortReportLength)
+        report[0] = shortReportID
+        report[1] = header.deviceIndex
+        report[2] = header.subID
+        report[3] = header.address
+        report.replaceSubrange(4..<(4 + parameters.count), with: parameters)
+        return report
+    }
+
     static func rootFeaturePayload(featureID: UInt16) -> [UInt8] {
         // Feature IDs are encoded big-endian, followed by the requested type.
         [UInt8(featureID >> 8), UInt8(featureID & 0xff), 0x00]
@@ -257,9 +354,45 @@ enum HIDPPProtocol {
         return exactResponse || errorResponse
     }
 
+    static func matchesResponse(
+        _ report: [UInt8],
+        request: ShortRegisterRequestHeader
+    ) -> Bool {
+        guard report.count >= shortReportLength,
+              report[0] == shortReportID,
+              report[1] == request.deviceIndex else {
+            return false
+        }
+        let exactResponse = report[2] == request.subID && report[3] == request.address
+        let errorResponse = report[2] == shortErrorSubID
+            && report[3] == request.subID
+            && report[4] == request.address
+        return exactResponse || errorResponse
+    }
+
     static func errorCode(in report: [UInt8]) -> UInt8? {
         guard report.count == longReportLength, report[2] == 0xff else { return nil }
         return report[5]
+    }
+
+    static func shortRegisterErrorCode(in report: [UInt8]) -> UInt8? {
+        guard report.count >= shortReportLength,
+              report[0] == shortReportID,
+              report[2] == shortErrorSubID else { return nil }
+        return report[5]
+    }
+
+    static func receiverNotificationFlags(in report: [UInt8]) -> ReceiverNotificationFlags? {
+        guard report.count >= shortReportLength,
+              report[0] == shortReportID,
+              report[1] == receiverDeviceIndex,
+              report[2] == getShortRegisterSubID,
+              report[3] == receiverNotificationRegister else { return nil }
+        return ReceiverNotificationFlags(
+            deviceFlags: report[4],
+            receiverFlags: report[5],
+            continuedDeviceFlags: report[6]
+        )
     }
 
     static func featureInformation(in report: [UInt8]) -> FeatureInformation? {

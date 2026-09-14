@@ -1,39 +1,29 @@
 import Foundation
+import Dispatch
 import HIDReportBridge
 import IOKit.hid
 
-private final class HIDDeviceCallbackContext {
-    /// Weak to avoid a retain cycle: HIDMonitor owns the subscription, the
-    /// subscription owns this context, and IOHIDLib only borrows its pointer.
-    weak var monitor: HIDMonitor?
-    /// Stable identity for one IOHIDDevice during its registered lifetime.
-    let deviceKey: UInt
-
-    init(monitor: HIDMonitor, deviceKey: UInt) {
-        self.monitor = monitor
-        self.deviceKey = deviceKey
-    }
-}
-
 /// Swift ABI entry point called by the C report filter. Pointer report 0x02 never reaches
-/// this function; only HID++ 0x11 traffic and the Receiver's low-frequency
-/// device-connection notifications cross into Swift.
+/// this function; only HID++ 0x11 traffic and the Receiver's low-frequency short
+/// responses and connection notifications cross into Swift. The manager callback
+/// supplies the originating IOHIDDevice as `sender`, which is used as the same
+/// process-local key stored by `HIDPPController`.
 ///
 /// The raw buffer belongs to IOHIDLib and is valid only for this callback. It
 /// is copied before returning; retaining `report` would be a use-after-free.
 @_cdecl("LogiMouseReceiveHIDPPReport")
 func logiMouseReceiveHIDPPReport(
     _ context: UnsafeMutableRawPointer?,
+    _ sender: UnsafeMutableRawPointer?,
     _ reportID: UInt32,
     _ report: UnsafeMutablePointer<UInt8>?,
     _ reportLength: Int,
     _ timestamp: UInt64
 ) {
-    guard let context, let report, reportLength > 0 else { return }
-    let callback = Unmanaged<HIDDeviceCallbackContext>
-        .fromOpaque(context).takeUnretainedValue()
-    callback.monitor?.receiveFilteredReport(
-        deviceKey: callback.deviceKey,
+    guard let context, let sender, let report, reportLength > 0 else { return }
+    let monitor = Unmanaged<HIDMonitor>.fromOpaque(context).takeUnretainedValue()
+    monitor.receiveFilteredReport(
+        deviceKey: UInt(bitPattern: sender),
         reportID: reportID,
         bytes: UnsafePointer(report),
         length: reportLength,
@@ -89,43 +79,37 @@ final class HIDMonitor {
     /// Logitech vendor usage pair that identifies HID++ inside the BLE descriptor.
     private static let bluetoothUsagePage = 0xff43
     private static let bluetoothUsage = 0x0202
-    private final class RawReportSubscription {
-        /// Retaining IOHIDDevice keeps the callback target alive until unregister.
-        let device: IOHIDDevice
-        /// Retains the object whose unowned pointer is passed through C.
-        let context: HIDDeviceCallbackContext
-        /// IOHIDLib writes each report into this reusable allocation.
-        let buffer: UnsafeMutablePointer<UInt8>
-        let capacity: Int
-
-        init(device: IOHIDDevice, context: HIDDeviceCallbackContext, capacity: Int) {
-            self.device = device
-            self.context = context
-            self.capacity = capacity
-            buffer = .allocate(capacity: capacity)
-            buffer.initialize(repeating: 0, count: capacity)
-        }
-
-        deinit {
-            buffer.deinitialize(count: capacity)
-            buffer.deallocate()
-        }
-    }
-
     private struct PendingDevice {
-        /// A match can arrive synchronously from IOHIDManagerOpen; activation is
-        /// deferred until `managerIsOpen` so registration order is deterministic.
+        /// A match can be delivered while manager activation is still in
+        /// progress; activation is deferred until `managerIsOpen` so routing
+        /// order remains deterministic.
         let device: IOHIDDevice
         let transport: HIDPPTransport
     }
 
+    /// All IOHID callbacks, including the device-wide raw-report callback, are
+    /// delivered here. Keeping this queue separate from the AppKit main
+    /// RunLoop prevents Bluetooth pointer reports (which the C bridge drops)
+    /// from competing with CGEvent processing and UI work.
+    private let hidQueue = DispatchQueue(
+        label: "dev.logi-mouse.hid-input",
+        // HID++ notifications are user-visible, but this queue must not be
+        // scheduled ahead of macOS's own pointer event processing. Bluetooth
+        // composite devices still wake the callback for report 0x02; the C
+        // bridge drops those reports before they reach this queue's Swift
+        // work. User-initiated priority keeps wheel latency low without
+        // treating the control channel as a display-critical UI task.
+        qos: .userInitiated
+    )
+    private let hidQueueKey = DispatchSpecificKey<Void>()
     private let controller = HIDPPController()
     private var manager: IOHIDManager?
     private var managerIsOpen = false
     private var pendingDevices: [UInt: PendingDevice] = [:]
-    private var reportSubscriptions: [UInt: RawReportSubscription] = [:]
+    private var acceptingReports = false
 
     init() {
+        hidQueue.setSpecific(key: hidQueueKey, value: ())
         controller.onStateChange = { [weak self] state in
             self?.onControllerStateChange?(state)
         }
@@ -142,6 +126,16 @@ final class HIDMonitor {
                 RuntimeLog.debug("hidpp", "layer=\(layer) \(message)")
             }
         }
+    }
+
+    /// Avoids a self-deadlock when a lifecycle operation is called from an
+    /// IOHID callback. All mutable manager state is otherwise confined to this
+    /// queue.
+    private func syncOnHIDQueue<T>(_ work: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: hidQueueKey) != nil {
+            return work()
+        }
+        return hidQueue.sync(execute: work)
     }
 
     func takeOverWheel(
@@ -176,7 +170,6 @@ final class HIDMonitor {
         switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
         case kIOHIDAccessTypeGranted:
             RuntimeLog.info("hid-input", "Input Monitoring permission granted")
-            break
         case kIOHIDAccessTypeDenied:
             RuntimeLog.error("hid-input", "Input Monitoring permission denied")
             throw HIDMonitorError.permissionDenied
@@ -186,71 +179,140 @@ final class HIDMonitor {
             throw HIDMonitorError.permissionPending
         }
 
-        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        self.manager = manager
-        // USB can be matched to one dedicated collection. Bluetooth must be
-        // matched by VID/PID first and validated against DeviceUsagePairs in
-        // `deviceMatched`, because its primary usage is keyboard rather than
-        // the nested Logitech vendor collection we need.
-        var matching: [[String: Int]] = [[
-            kIOHIDVendorIDKey: Self.logitechVendorID,
-            kIOHIDProductIDKey: Self.unifyingReceiverProductID,
-            kIOHIDPrimaryUsagePageKey: 0xff00,
-            kIOHIDPrimaryUsageKey: 1,
-        ]]
-        for productID in MouseConnectionResolver.supportedBluetoothProductIDs {
-            matching.append([
+        // Configure and activate the manager on its own serial queue. This is
+        // deliberately synchronous only during startup, so the caller retains
+        // the existing throwing permission/open contract while every later HID
+        // callback stays off the AppKit main RunLoop.
+        let result = syncOnHIDQueue { () -> IOReturn in
+            guard self.manager == nil else { return kIOReturnBusy }
+            let manager = IOHIDManagerCreate(
+                kCFAllocatorDefault,
+                IOOptionBits(kIOHIDOptionsTypeNone)
+            )
+            self.manager = manager
+            self.managerIsOpen = false
+            self.acceptingReports = false
+            self.pendingDevices.removeAll(keepingCapacity: true)
+
+            // USB can be matched to one dedicated collection. Bluetooth must be
+            // matched by VID/PID first and validated against DeviceUsagePairs in
+            // `deviceMatched`, because its primary usage is keyboard rather than
+            // the nested Logitech vendor collection we need.
+            var matching: [[String: Int]] = [[
                 kIOHIDVendorIDKey: Self.logitechVendorID,
-                kIOHIDProductIDKey: productID,
-                // Do not add a usage constraint here. The Bluetooth mouse is a
-                // single composite IOHIDDevice whose primary usage is keyboard;
-                // FF43/0202 appears only in DeviceUsagePairs and is not reliably
-                // honored by IOHIDManager's device-matching dictionary. The
-                // callback below validates that pair before opening a channel.
-            ])
+                kIOHIDProductIDKey: Self.unifyingReceiverProductID,
+                kIOHIDPrimaryUsagePageKey: 0xff00,
+                kIOHIDPrimaryUsageKey: 1,
+            ]]
+            for productID in MouseConnectionResolver.supportedBluetoothProductIDs {
+                matching.append([
+                    kIOHIDVendorIDKey: Self.logitechVendorID,
+                    kIOHIDProductIDKey: productID,
+                    // Do not add a usage constraint here. The Bluetooth mouse
+                    // is a single composite IOHIDDevice whose primary usage is
+                    // keyboard; FF43/0202 appears only in DeviceUsagePairs and
+                    // is not reliably honored by IOHIDManager's matching.
+                ])
+            }
+            IOHIDManagerSetDeviceMatchingMultiple(manager, matching as CFArray)
+            RuntimeLog.info(
+                "hid-input",
+                "Configured HID matching dictionaries count=\(matching.count)"
+            )
+
+            // A dispatch queue and a RunLoop are mutually exclusive for one
+            // manager. Register every callback before activation, as required by
+            // IOHIDLib's dispatch-queue contract.
+            IOHIDManagerSetDispatchQueue(manager, self.hidQueue)
+            IOHIDManagerRegisterDeviceMatchingCallback(
+                manager,
+                { context, result, _, device in
+                    guard let context else { return }
+                    guard result == kIOReturnSuccess else {
+                        RuntimeLog.error(
+                            "hid-input",
+                            String(
+                                format: "HID device matching callback failed result=0x%08x",
+                                result
+                            )
+                        )
+                        return
+                    }
+                    Unmanaged<HIDMonitor>.fromOpaque(context)
+                        .takeUnretainedValue()
+                        .deviceMatched(device)
+                },
+                Unmanaged.passUnretained(self).toOpaque()
+            )
+            IOHIDManagerRegisterDeviceRemovalCallback(
+                manager,
+                { context, result, _, device in
+                    guard let context else { return }
+                    guard result == kIOReturnSuccess else {
+                        RuntimeLog.error(
+                            "hid-input",
+                            String(
+                                format: "HID device removal callback failed result=0x%08x",
+                                result
+                            )
+                        )
+                        return
+                    }
+                    Unmanaged<HIDMonitor>.fromOpaque(context)
+                        .takeUnretainedValue()
+                        .deviceRemoved(device)
+                },
+                Unmanaged.passUnretained(self).toOpaque()
+            )
+            IOHIDManagerRegisterInputReportWithTimeStampCallback(
+                manager,
+                LMHIDPPFilteredReportCallback,
+                Unmanaged.passUnretained(self).toOpaque()
+            )
+            // Retain the callback context until IOKit has finished cancelling.
+            // Clearing manager here breaks the temporary ownership cycle.
+            IOHIDManagerSetCancelHandler(manager) { [self] in
+                if let manager = self.manager {
+                    IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+                }
+                self.manager = nil
+                RuntimeLog.debug("hid-input", "IOHIDManager cancellation handler completed")
+            }
+
+            // Keep the existing explicit open so permission/transport failures
+            // remain observable. Activation is still required after assigning a
+            // dispatch queue; it is idempotent if this OS opens the manager as a
+            // side effect of IOHIDManagerOpen.
+            let result = IOHIDManagerOpen(
+                manager,
+                IOOptionBits(kIOHIDOptionsTypeNone)
+            )
+            guard result == kIOReturnSuccess else {
+                self.pendingDevices.removeAll(keepingCapacity: true)
+                // Dispatch resources still need activation/cancellation when
+                // opening fails. Input stays gated until the handler releases us.
+                IOHIDManagerActivate(manager)
+                IOHIDManagerCancel(manager)
+                return result
+            }
+            self.managerIsOpen = true
+            self.acceptingReports = true
+            IOHIDManagerActivate(manager)
+            self.activatePendingDevices()
+            RuntimeLog.info(
+                "hid-input",
+                "IOHIDManager opened and activated on dedicated HID dispatch queue"
+            )
+            return result
         }
-        IOHIDManagerSetDeviceMatchingMultiple(manager, matching as CFArray)
-        RuntimeLog.info("hid-input", "Configured HID matching dictionaries count=\(matching.count)")
 
-        IOHIDManagerRegisterDeviceMatchingCallback(
-            manager,
-            { context, result, _, device in
-                guard let context else { return }
-                guard result == kIOReturnSuccess else {
-                    RuntimeLog.error("hid-input", String(format: "HID device matching callback failed result=0x%08x", result))
-                    return
-                }
-                Unmanaged<HIDMonitor>.fromOpaque(context).takeUnretainedValue().deviceMatched(device)
-            },
-            Unmanaged.passUnretained(self).toOpaque()
-        )
-        IOHIDManagerRegisterDeviceRemovalCallback(
-            manager,
-            { context, result, _, device in
-                guard let context else { return }
-                guard result == kIOReturnSuccess else {
-                    RuntimeLog.error("hid-input", String(format: "HID device removal callback failed result=0x%08x", result))
-                    return
-                }
-                Unmanaged<HIDMonitor>.fromOpaque(context).takeUnretainedValue().deviceRemoved(device)
-            },
-            Unmanaged.passUnretained(self).toOpaque()
-        )
-        // IOHIDManager callbacks are delivered on the main run loop. The raw
-        // report is timestamped in the kernel before this scheduling hop, so
-        // model timing uses the hardware timestamp rather than callback time.
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-        RuntimeLog.info("hid-input", "Registered HID match/removal callbacks and scheduled manager on main run loop")
-
-        let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         guard result == kIOReturnSuccess else {
-            RuntimeLog.error("hid-input", String(format: "IOHIDManagerOpen failed result=0x%08x", result))
-            stop()
+            RuntimeLog.error(
+                "hid-input",
+                String(format: "IOHIDManagerOpen failed result=0x%08x", result)
+            )
             throw HIDMonitorError.managerOpenFailed(result)
         }
-        managerIsOpen = true
-        RuntimeLog.info("hid-input", "IOHIDManager opened successfully")
-        activatePendingDevices()
     }
 
     func stop() {
@@ -268,30 +330,33 @@ final class HIDMonitor {
     }
 
     private func teardown(restoringHardware: Bool) {
-        guard let manager else {
+        guard let manager = syncOnHIDQueue({ self.managerIsOpen ? self.manager : nil }) else {
             RuntimeLog.debug("hid-input", "HID monitor teardown skipped because manager is not active")
             return
         }
         RuntimeLog.notice(
             "hid-input",
-            "Tearing down HID monitor restoringHardware=\(restoringHardware) subscriptions=\(reportSubscriptions.count) pendingDevices=\(pendingDevices.count)"
+            "Tearing down HID monitor restoringHardware=\(restoringHardware) pendingDevices=\(syncOnHIDQueue { pendingDevices.count })"
         )
         if restoringHardware {
-            // Restore hardware before unregistering the report callback: restore
+            // Restore hardware before cancelling the report callback: restore
             // requests need their 0x11 replies to wake HIDPPController.call().
             controller.restoreSynchronously()
         } else {
-            // Reject late reports before unregistering their callback contexts.
-            // The old controller generation must never recover independently.
+            // Reject late reports before cancelling the manager. The old
+            // controller generation must never recover independently.
             controller.invalidateForSystemSleep()
         }
-        removeAllSubscriptions()
-        managerIsOpen = false
-        pendingDevices.removeAll()
-        IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-        self.manager = nil
-        RuntimeLog.info("hid-input", "HID monitor teardown completed restoringHardware=\(restoringHardware)")
+
+        // Cancellation is asynchronous. The cancel handler owns final release;
+        // a queue barrier alone cannot wait for IOKit's internal sources.
+        syncOnHIDQueue {
+            acceptingReports = false
+            managerIsOpen = false
+            pendingDevices.removeAll(keepingCapacity: true)
+            IOHIDManagerCancel(manager)
+        }
+        RuntimeLog.info("hid-input", "HID monitor cancellation requested restoringHardware=\(restoringHardware)")
     }
 
     fileprivate func receiveFilteredReport(
@@ -301,19 +366,48 @@ final class HIDMonitor {
         length: Int,
         timestamp: UInt64
     ) {
-        guard controller.acceptsDevice(key: deviceKey) else { return }
+        // This method is called by the manager callback on `hidQueue`. Reject
+        // reports queued during cancellation before touching controller state.
+        guard acceptingReports, controller.acceptsDevice(key: deviceKey) else { return }
         let reportBytes = Array(UnsafeBufferPointer(start: bytes, count: length))
+        // Both HID++ generations share one interrupt pipe. Resolve an exact
+        // short/long command response before decoding unsolicited events.
+        if controller.observeReport(reportBytes) { return }
         if let event = HIDPPProtocol.receiverConnectionEvent(
             reportID: reportID,
             bytes: reportBytes
         ) {
             // The USB interface itself remains present while the paired mouse
-            // is off. Report 0x10/sub-ID 0x41 is the actual radio-link signal.
+            // is off. Report 0x10/sub-ID 0x40/0x41 is the radio-link signal.
             RuntimeLog.notice(
                 "hid-input",
-                String(format: "Receiver link event key=0x%llx event=%@", deviceKey, String(describing: event))
+                String(
+                    format: "Receiver link event key=0x%llx sub_id=0x%02x slot=%u connected=%@ raw=%@",
+                    deviceKey,
+                    reportBytes[2],
+                    event.deviceIndex,
+                    event.isConnected ? "true" : "false",
+                    reportBytes.map { String(format: "%02x", $0) }.joined()
+                )
             )
             controller.observeReceiverConnection(deviceKey: deviceKey, event: event)
+            return
+        }
+        if reportID == UInt32(HIDPPProtocol.shortReportID) {
+            let subID = reportBytes.count > 2 ? reportBytes[2] : 0
+            if subID == HIDPPProtocol.getShortRegisterSubID
+                || subID == HIDPPProtocol.setShortRegisterSubID
+                || subID == HIDPPProtocol.shortErrorSubID {
+                RuntimeLog.warning(
+                    "hid-input",
+                    String(
+                        format: "Unmatched Receiver short response key=0x%llx sub_id=0x%02x raw=%@",
+                        deviceKey,
+                        subID,
+                        reportBytes.map { String(format: "%02x", $0) }.joined()
+                    )
+                )
+            }
             return
         }
         guard HIDPPProtocol.isLongInputReport(reportID) else { return }
@@ -333,11 +427,8 @@ final class HIDMonitor {
               reportBytes.count == HIDPPProtocol.longReportLength,
               reportBytes.first == HIDPPProtocol.longReportID else { return }
 
-        // Command replies and unsolicited wheel events share report 0x11. Give
-        // the controller the report first so an exact pending request can wake
-        // before attempting event decoding.
-        controller.observeReport(reportBytes)
         let deviceIndex = reportBytes.count > 1 ? reportBytes[1] : 0
+        let eventTimestamp = MonotonicClock.toNanoseconds(timestamp)
 
         let wheelEvent = HIDPPReportDecoder.decodeWheelEvent(
             reportID: UInt32(HIDPPProtocol.longReportID),
@@ -350,7 +441,7 @@ final class HIDMonitor {
                 deviceIndex: wheelEvent.deviceIndex,
                 featureIndex: wheelEvent.featureIndex
             )
-            onWheelEvent?(wheelEvent, MonotonicClock.toNanoseconds(timestamp))
+            publishWheelEvent(wheelEvent, timestampNs: eventTimestamp)
         }
 
         let thumbwheelEvent = HIDPPReportDecoder.decodeThumbwheelEvent(
@@ -364,8 +455,21 @@ final class HIDMonitor {
                 deviceIndex: thumbwheelEvent.deviceIndex,
                 featureIndex: thumbwheelEvent.featureIndex
             )
-            onThumbwheelEvent?(thumbwheelEvent, MonotonicClock.toNanoseconds(timestamp))
+            publishThumbwheelEvent(thumbwheelEvent, timestampNs: eventTimestamp)
         }
+    }
+
+    /// Wheel callbacks are the high-frequency data path. They are delivered on
+    /// `hidQueue`; the coordinator wires them to `ScrollOutputPipeline`, which
+    /// performs model work without enqueueing one main-actor task per report.
+    /// Low-frequency controller/UI callbacks retain their explicit main-queue
+    /// handoff inside `HIDPPController`.
+    private func publishWheelEvent(_ event: HIDPPWheelEvent, timestampNs: UInt64) {
+        onWheelEvent?(event, timestampNs)
+    }
+
+    private func publishThumbwheelEvent(_ event: HIDPPThumbwheelEvent, timestampNs: UInt64) {
+        onThumbwheelEvent?(event, timestampNs)
     }
 
     private func deviceMatched(_ device: IOHIDDevice) {
@@ -420,7 +524,6 @@ final class HIDMonitor {
         RuntimeLog.info("hid-input", "Activating pending HID++ devices count=\(pendingDevices.count)")
         var activatedKeys: [UInt] = []
         for (key, pending) in pendingDevices {
-            installRawReportSubscription(device: pending.device, key: key)
             activatedKeys.append(key)
             controller.considerDevice(pending.device, key: key, transport: pending.transport)
         }
@@ -434,60 +537,6 @@ final class HIDMonitor {
         RuntimeLog.notice("hid-input", String(format: "HID++ device removed key=0x%llx", key))
         pendingDevices.removeValue(forKey: key)
         controller.removeDevice(key: key)
-        removeSubscription(key: key)
-    }
-
-    /// Installs one device-wide raw-report callback.
-    ///
-    /// The buffer must outlive callback registration, so it is stored inside
-    /// RawReportSubscription rather than allocated on the stack. Capacity is
-    /// at least one HID++ long report and otherwise follows the descriptor's
-    /// `MaxInputReportSize`. USB exposes only HID++, while Bluetooth is
-    /// composite; LMHIDPPFilteredReportCallback drops high-rate pointer reports
-    /// before any Swift allocation or locking occurs.
-    private func installRawReportSubscription(device: IOHIDDevice, key: UInt) {
-        guard reportSubscriptions[key] == nil else { return }
-        let capacity = max(
-            HIDPPProtocol.longReportLength,
-            Self.integerProperty(kIOHIDMaxInputReportSizeKey, device: device) ?? 32
-        )
-        let context = HIDDeviceCallbackContext(monitor: self, deviceKey: key)
-        let subscription = RawReportSubscription(
-            device: device,
-            context: context,
-            capacity: capacity
-        )
-        reportSubscriptions[key] = subscription
-        IOHIDDeviceRegisterInputReportWithTimeStampCallback(
-            device,
-            subscription.buffer,
-            subscription.capacity,
-            LMHIDPPFilteredReportCallback,
-            Unmanaged.passUnretained(context).toOpaque()
-        )
-        RuntimeLog.info(
-            "hid-input",
-            String(format: "Registered raw HID++ report callback key=0x%llx capacity=%d", key, capacity)
-        )
-    }
-
-    private func removeSubscription(key: UInt) {
-        if let subscription = reportSubscriptions.removeValue(forKey: key) {
-            // Unregister while both buffer and context are still retained by
-            // the local `subscription`; deallocation happens after this call.
-            IOHIDDeviceRegisterInputReportWithTimeStampCallback(
-                subscription.device,
-                subscription.buffer,
-                subscription.capacity,
-                nil,
-                nil
-            )
-            RuntimeLog.info("hid-input", String(format: "Unregistered raw HID++ report callback key=0x%llx", key))
-        }
-    }
-
-    private func removeAllSubscriptions() {
-        for key in Array(reportSubscriptions.keys) { removeSubscription(key: key) }
     }
 
     private static func deviceKey(_ device: IOHIDDevice) -> UInt {

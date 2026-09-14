@@ -313,7 +313,6 @@ final class MouseManagerWindowController: NSWindowController {
     ) {
         switch result {
         case .success:
-            coordinator.setGlobalOutputEnabled(true)
             smoothScrollingSwitch.state = .on
             statusLabel.stringValue = "平滑滚动已开启"
             saveSmoothScrollingEnabled(true)
@@ -341,7 +340,6 @@ final class MouseManagerWindowController: NSWindowController {
 
     private func disableSmoothScrolling() {
         setSmoothTransition(true)
-        coordinator.setGlobalOutputEnabled(false)
         guard coordinator.isTakeoverEnabled else {
             finishSmoothDisable()
             return
@@ -352,7 +350,6 @@ final class MouseManagerWindowController: NSWindowController {
             case .success:
                 self.finishSmoothDisable()
             case let .failure(error):
-                self.coordinator.setGlobalOutputEnabled(true)
                 self.smoothScrollingSwitch.state = .on
                 self.statusLabel.stringValue = error.localizedDescription
                 self.showError(error.localizedDescription)

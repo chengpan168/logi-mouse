@@ -14,9 +14,10 @@ import Foundation
 /// those decisions through `runtimeState.generation`.
 @MainActor
 final class MouseRuntimeCoordinator {
+    static let modelDiagnosticSampleLimit = ScrollOutputPipeline.diagnosticSampleLimit
+
     private(set) var runtimeState = MouseRuntimeState()
     private(set) var isLiveModelEnabled = false
-    private(set) var isGlobalOutputEnabled = false
 
     /// Compatibility-facing name used by the current settings window. Its
     /// meaning is user intent, not proof that firmware is currently diverted.
@@ -39,12 +40,11 @@ final class MouseRuntimeCoordinator {
     private var takeoverRecoveryInFlight = false
     private var eventSequence: UInt64 = 0
     private var sleepBeganAt: Date?
-
-    private var verticalModel = ScrollDynamicsModel()
-    private var horizontalModel = ScrollDynamicsModel()
-    /// Prevents the session-wide event tap from suppressing a trackpad or a
-    /// second mouse merely because the target Logitech mouse is diverted.
-    private let targetScrollCorrelation = TargetScrollCorrelation()
+    private var scrollDirection: ScrollDirectionMapping = .natural
+    /// The only owner of high-frequency model state and native-scroll
+    /// correlation. Keeping it outside the main actor prevents one task per HID
+    /// report from competing with pointer event delivery.
+    private let scrollOutputPipeline = ScrollOutputPipeline()
 
     init() {
         systemLifecycleMonitor.onWillSleep = { [weak self] in
@@ -65,25 +65,48 @@ final class MouseRuntimeCoordinator {
     }
 
     func setLiveModelEnabled(_ enabled: Bool, direction: ScrollDirectionMapping) throws {
-        guard isRunning, let eventMonitor else { return }
+        RuntimeLog.notice(
+            "takeover",
+            "Live model change requested enabled=\(enabled) direction=\(direction.rawValue) "
+                + "before={\(runtimeDiagnosticSnapshot)}"
+        )
+        guard isRunning, let eventMonitor else {
+            RuntimeLog.warning(
+                "takeover",
+                "Live model change skipped enabled=\(enabled) reason=runtime-not-ready "
+                    + "state={\(runtimeDiagnosticSnapshot)}"
+            )
+            return
+        }
         if enabled {
-            verticalModel = ScrollDynamicsModel(directionMapping: direction)
-            horizontalModel = ScrollDynamicsModel(directionMapping: direction)
             try eventMonitor.setSuppressionEnabled(true)
             isLiveModelEnabled = true
         } else {
             isLiveModelEnabled = false
-            isGlobalOutputEnabled = false
             resetModelsAndCorrelation()
             try eventMonitor.setSuppressionEnabled(false)
         }
+        syncScrollOutputPipeline()
+        RuntimeLog.notice(
+            "takeover",
+            "Live model change completed enabled=\(enabled) after={\(runtimeDiagnosticSnapshot)}"
+        )
     }
 
     func setTakeoverEnabled(
         _ enabled: Bool,
         completion: @escaping (Result<HIDPPController.State, Error>) -> Void
     ) {
+        RuntimeLog.notice(
+            "takeover",
+            "User takeover change requested enabled=\(enabled) state={\(runtimeDiagnosticSnapshot)}"
+        )
         guard isRunning, let hidMonitor else {
+            RuntimeLog.warning(
+                "takeover",
+                "User takeover change rejected enabled=\(enabled) reason=no-active-hid-monitor "
+                    + "state={\(runtimeDiagnosticSnapshot)}"
+            )
             completion(.failure(HIDPPControllerError.noHIDPPChannel))
             return
         }
@@ -104,9 +127,20 @@ final class MouseRuntimeCoordinator {
                 guard let self,
                       self.runtimeState.generation == generation else { return }
                 switch result {
-                case .success:
+                case let .success(controllerState):
+                    self.armModelDiagnostics(reason: "user-takeover-succeeded")
+                    RuntimeLog.notice(
+                        "takeover",
+                        "User takeover succeeded generation=\(generation) controller={\(controllerState)} "
+                            + "state={\(self.runtimeDiagnosticSnapshot)}"
+                    )
                     try? self.send(.takeoverSucceeded(generation: generation))
                 case let .failure(error):
+                    RuntimeLog.error(
+                        "takeover",
+                        "User takeover failed generation=\(generation) error=\(error.localizedDescription) "
+                            + "state={\(self.runtimeDiagnosticSnapshot)}"
+                    )
                     // A direct user action is transactional: failure returns the
                     // switch to OFF. Sleep recovery uses a separate effect that
                     // deliberately preserves intent across bounded failures.
@@ -127,9 +161,19 @@ final class MouseRuntimeCoordinator {
                 guard let self,
                       self.runtimeState.generation == generation else { return }
                 switch result {
-                case .success:
+                case let .success(controllerState):
+                    RuntimeLog.notice(
+                        "takeover",
+                        "User restoration succeeded generation=\(generation) controller={\(controllerState)} "
+                            + "state={\(self.runtimeDiagnosticSnapshot)}"
+                    )
                     try? self.send(.restorationSucceeded(generation: generation))
                 case let .failure(error):
+                    RuntimeLog.error(
+                        "takeover",
+                        "User restoration failed generation=\(generation) error=\(error.localizedDescription) "
+                            + "state={\(self.runtimeDiagnosticSnapshot)}"
+                    )
                     try? self.send(.restorationFailed(
                         message: error.localizedDescription,
                         generation: generation
@@ -141,23 +185,51 @@ final class MouseRuntimeCoordinator {
     }
 
     func setDirection(_ direction: ScrollDirectionMapping) {
-        verticalModel.setDirectionMapping(direction)
-        horizontalModel.setDirectionMapping(direction)
+        let previous = scrollDirection
+        scrollDirection = direction
+        syncScrollOutputPipeline()
+        RuntimeLog.notice(
+            "takeover",
+            "Scroll direction applied from=\(previous.rawValue) to=\(direction.rawValue) "
+                + "multiplier=\(direction.multiplier) generation=\(runtimeState.generation)"
+        )
     }
 
     /// Performs a low-frequency read-back when the control window opens.
     /// Ordinary scroll reports remain pure data events and never enter this path.
     func verifyTakeoverMode() {
-        guard isRunning, isTakeoverEnabled else { return }
+        guard isRunning, isTakeoverEnabled else {
+            RuntimeLog.debug(
+                "takeover",
+                "Verification skipped running=\(isRunning) requested=\(isTakeoverEnabled) "
+                    + "state={\(runtimeDiagnosticSnapshot)}"
+            )
+            return
+        }
         let generation = runtimeState.generation
+        RuntimeLog.notice(
+            "takeover",
+            "Verification requested generation=\(generation) state={\(runtimeDiagnosticSnapshot)}"
+        )
         try? send(.verificationStarted(generation: generation))
         hidMonitor?.verifyWheelMode { [weak self] result in
             guard let self,
                   self.runtimeState.generation == generation else { return }
             switch result {
             case let .success(axes):
+                self.armModelDiagnostics(reason: "verification-succeeded")
+                RuntimeLog.notice(
+                    "takeover",
+                    "Verification succeeded generation=\(generation) "
+                        + "axes={vertical:\(axes.vertical),horizontal:\(axes.horizontal)}"
+                )
                 try? self.send(.verificationSucceeded(axes, generation: generation))
             case let .failure(error):
+                RuntimeLog.error(
+                    "takeover",
+                    "Verification failed generation=\(generation) error=\(error.localizedDescription) "
+                        + "state={\(self.runtimeDiagnosticSnapshot)}"
+                )
                 try? self.send(.verificationFailed(
                     message: error.localizedDescription,
                     generation: generation
@@ -171,15 +243,6 @@ final class MouseRuntimeCoordinator {
         hidMonitor?.refreshBattery()
     }
 
-    func setGlobalOutputEnabled(_ enabled: Bool) {
-        guard isRunning, isLiveModelEnabled else {
-            isGlobalOutputEnabled = false
-            return
-        }
-        isGlobalOutputEnabled = enabled
-        resetModelsAndCorrelation()
-    }
-
     /// Stops permanently and restores hardware when possible. System sleep must
     /// use the reducer's suspend effect instead; conflating the two paths caused
     /// synchronous HID timeouts while the machine was going to sleep.
@@ -187,8 +250,8 @@ final class MouseRuntimeCoordinator {
         try? send(.stopRequested)
         systemLifecycleMonitor.stop()
         isLiveModelEnabled = false
-        isGlobalOutputEnabled = false
         resetModelsAndCorrelation()
+        syncScrollOutputPipeline()
     }
 
     // MARK: - State machine
@@ -204,6 +267,7 @@ final class MouseRuntimeCoordinator {
             "power",
             "========== SYSTEM SUSPEND HANDLING FINISHED | after={\(runtimeDiagnosticSnapshot)} =========="
         )
+        RuntimeLog.flush()
     }
 
     private func handleSystemDidWake() {
@@ -275,12 +339,17 @@ final class MouseRuntimeCoordinator {
             "state-machine",
             "END sequence=\(sequence) event=\(eventName) after={\(runtimeDiagnosticSnapshot)}"
         )
+        // Keep the hot-path gate in sync with the reduced state without making
+        // HID reports themselves enter this actor.
+        syncScrollOutputPipeline()
     }
 
     private var runtimeDiagnosticSnapshot: String {
         runtimeState.diagnosticDescription
+            + " direction=\(scrollDirection.rawValue)"
+            + " directionMultiplier=\(scrollDirection.multiplier)"
             + " liveModelEnabled=\(isLiveModelEnabled)"
-            + " globalOutputEnabled=\(isGlobalOutputEnabled)"
+            + " outputGate={vertical:\(outputIsActive(.vertical)),horizontal:\(outputIsActive(.horizontal))}"
             + " monitors={lifecycle:true,connection:\(connectionMonitor != nil),hid:\(hidMonitor != nil),cgEvent:\(eventMonitor != nil)}"
             + " work={wakeTimer:\(wakeRetryWorkItem != nil),takeoverRetryTimer:\(takeoverRetryWorkItem != nil),takeoverRecovery:\(takeoverRecoveryInFlight)}"
     }
@@ -406,6 +475,9 @@ final class MouseRuntimeCoordinator {
             "runtime",
             "Releasing runtime monitors restoringHardware=\(restoringHardware) cgEvent=\(eventMonitor != nil) connection=\(connectionMonitor != nil) hid=\(hidMonitor != nil)"
         )
+        // Close the output gate before tearing down listeners. Any report that
+        // races with cancellation is then rejected by generation/enable checks.
+        scrollOutputPipeline.deactivate(generation: runtimeState.generation)
         if eventMonitor != nil { RuntimeLog.info("runtime", "Monitor teardown stage=cg-event-stop") }
         eventMonitor?.stop()
         if connectionMonitor != nil { RuntimeLog.info("runtime", "Monitor teardown stage=connection-stop") }
@@ -441,15 +513,15 @@ final class MouseRuntimeCoordinator {
                   self.runtimeState.generation == generation else { return }
             self.onConnectionChange?(connection)
         }
-        hidMonitor.onWheelEvent = { [weak self] event, timestamp in
-            guard let self,
-                  self.runtimeState.generation == generation else { return }
-            self.processVertical(event, timestampNs: timestamp)
+        // These callbacks run on HIDMonitor's dedicated queue. Capture only the
+        // pipeline and generation; touching the @MainActor coordinator here
+        // would recreate the per-report main-run-loop backlog.
+        let pipeline = scrollOutputPipeline
+        hidMonitor.onWheelEvent = { event, timestamp in
+            pipeline.enqueueWheel(event, timestampNs: timestamp, generation: generation)
         }
-        hidMonitor.onThumbwheelEvent = { [weak self] event, timestamp in
-            guard let self,
-                  self.runtimeState.generation == generation else { return }
-            self.processHorizontal(event, timestampNs: timestamp)
+        hidMonitor.onThumbwheelEvent = { event, timestamp in
+            pipeline.enqueueThumbwheel(event, timestampNs: timestamp, generation: generation)
         }
         hidMonitor.onControllerStateChange = { [weak self] controllerState in
             guard let self,
@@ -461,29 +533,42 @@ final class MouseRuntimeCoordinator {
         hidMonitor.onTakeoverAxesChange = { [weak self] axes in
             guard let self,
                   self.runtimeState.generation == generation else { return }
+            let previousAxes = self.runtimeState.verifiedAxes
             try? self.send(.takeoverAxesChanged(axes, generation: generation))
-            self.invalidateModels(forLostAxes: axes)
+            self.syncScrollOutputPipeline()
+            RuntimeLog.notice(
+                "takeover",
+                "Axis evidence changed generation=\(generation) "
+                    + "from={vertical:\(previousAxes.vertical),horizontal:\(previousAxes.horizontal)} "
+                    + "to={vertical:\(axes.vertical),horizontal:\(axes.horizontal)} "
+                    + "state={\(self.runtimeDiagnosticSnapshot)}"
+            )
         }
         hidMonitor.onBatteryStateChange = { [weak self] batteryState in
             guard let self,
                   self.runtimeState.generation == generation else { return }
             self.onBatteryStateChange?(batteryState)
         }
-        eventMonitor.shouldSuppressVerticalScroll = { [weak self] in
-            guard let self else { return false }
-            return self.outputIsActive(.vertical)
-                && self.targetScrollCorrelation.consumeMatch(
-                    .vertical,
-                    timestampNs: MonotonicClock.nowNanoseconds()
-                )
+        eventMonitor.shouldSuppressVerticalScroll = { [pipeline] in
+            pipeline.shouldSuppress(
+                .vertical,
+                timestampNs: MonotonicClock.nowNanoseconds()
+            )
         }
-        eventMonitor.shouldSuppressHorizontalScroll = { [weak self] in
-            guard let self else { return false }
-            return self.outputIsActive(.horizontal)
-                && self.targetScrollCorrelation.consumeMatch(
-                    .horizontal,
-                    timestampNs: MonotonicClock.nowNanoseconds()
-                )
+        eventMonitor.shouldSuppressHorizontalScroll = { [pipeline] in
+            pipeline.shouldSuppress(
+                .horizontal,
+                timestampNs: MonotonicClock.nowNanoseconds()
+            )
+        }
+        eventMonitor.scrollDiagnosticContext = { [weak self] in
+            guard let self else { return "runtime=deallocated generation=\(generation)" }
+            return "generation=\(generation) current_generation=\(self.runtimeState.generation) "
+                + "direction=\(self.scrollDirection.rawValue) "
+                + "direction_multiplier=\(self.scrollDirection.multiplier) "
+                + "takeover_requested=\(self.runtimeState.takeoverRequested) "
+                + "verified_axes={vertical:\(self.runtimeState.verifiedAxes.vertical),horizontal:\(self.runtimeState.verifiedAxes.horizontal)} "
+                + "output_gate={vertical:\(self.outputIsActive(.vertical)),horizontal:\(self.outputIsActive(.horizontal))}"
         }
     }
 
@@ -512,6 +597,7 @@ final class MouseRuntimeCoordinator {
             self.takeoverRecoveryInFlight = false
             switch result {
             case .success:
+                self.armModelDiagnostics(reason: "wake-takeover-recovery-succeeded")
                 RuntimeLog.notice("runtime", "Takeover recovery succeeded generation=\(generation) attempt=\(attempt)")
                 try? self.send(.takeoverSucceeded(generation: generation))
                 self.onStatusChange?("平滑滚动已恢复")
@@ -543,66 +629,30 @@ final class MouseRuntimeCoordinator {
         takeoverRecoveryInFlight = false
     }
 
-    // MARK: - Data path
-
-    private func processVertical(_ event: HIDPPWheelEvent, timestampNs: UInt64) {
-        guard outputIsActive(.vertical) else {
-            verticalModel.reset()
-            return
-        }
-        targetScrollCorrelation.record(
-            .vertical,
-            timestampNs: timestampNs,
-            eventCount: max(1, Int(event.flags & 0x0f))
-        )
-        let output = verticalModel.process(
-            delta: event.delta,
-            flags: event.flags,
-            timestampNs: timestampNs
-        )
-        for pixels in output.pixelDeltas {
-            CGScrollInjector.post(pixelDelta: pixels)
-        }
-    }
-
-    private func processHorizontal(_ event: HIDPPThumbwheelEvent, timestampNs: UInt64) {
-        guard outputIsActive(.horizontal) else {
-            horizontalModel.reset()
-            return
-        }
-        guard event.rotation != 0 else { return }
-        targetScrollCorrelation.record(.horizontal, timestampNs: timestampNs)
-        let output = horizontalModel.process(
-            delta: -event.rotation,
-            flags: 0x11,
-            timestampNs: timestampNs
-        )
-        for pixels in output.pixelDeltas {
-            CGScrollInjector.postHorizontal(pixelDelta: pixels)
-        }
-    }
-
     private func outputIsActive(_ axis: ScrollAxis) -> Bool {
         isLiveModelEnabled
-            && isGlobalOutputEnabled
             && runtimeState.outputIsVerified(for: axis)
     }
 
-    private func invalidateModels(forLostAxes axes: HIDPPTakeoverAxes) {
-        if !axes.vertical {
-            verticalModel.reset()
-            targetScrollCorrelation.reset(.vertical)
-        }
-        if !axes.horizontal {
-            horizontalModel.reset()
-            targetScrollCorrelation.reset(.horizontal)
-        }
+    /// Copies the low-frequency application gate into the dedicated input
+    /// pipeline. The copy is value-based and synchronous only with the small
+    /// pipeline configuration/reset operation; no HID event waits on the main
+    /// actor after this method returns.
+    private func syncScrollOutputPipeline() {
+        scrollOutputPipeline.configure(
+            generation: runtimeState.generation,
+            direction: scrollDirection,
+            verticalEnabled: outputIsActive(.vertical),
+            horizontalEnabled: outputIsActive(.horizontal)
+        )
     }
 
     private func resetModelsAndCorrelation() {
-        verticalModel.reset()
-        horizontalModel.reset()
-        targetScrollCorrelation.reset()
+        scrollOutputPipeline.reset()
+    }
+
+    private func armModelDiagnostics(reason: String) {
+        scrollOutputPipeline.armDiagnostics(reason: reason)
     }
 
     private func publishStatus(for state: HIDPPController.State) {

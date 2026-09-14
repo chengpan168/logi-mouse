@@ -5,11 +5,25 @@ import IOKit.hid
 ///
 /// HID++ exposes only a four-bit software identifier, so all callers must use
 /// the controller's serial operation queue and this one shared session. Wheel
-/// notifications may use the same report ID but cannot complete a request
-/// unless their full response header matches.
+/// notifications and short Receiver events use the same input pipe but cannot
+/// complete a request unless their full response header matches.
 final class HIDPPRequestSession {
+    private enum ExpectedResponse {
+        case long(HIDPPProtocol.RequestHeader)
+        case shortRegister(HIDPPProtocol.ShortRegisterRequestHeader)
+
+        func matches(_ report: [UInt8]) -> Bool {
+            switch self {
+            case let .long(header):
+                HIDPPProtocol.matchesResponse(report, request: header)
+            case let .shortRegister(header):
+                HIDPPProtocol.matchesResponse(report, request: header)
+            }
+        }
+    }
+
     private struct PendingRequest {
-        let header: HIDPPProtocol.RequestHeader
+        let expectedResponse: ExpectedResponse
         var response: [UInt8]?
     }
 
@@ -21,7 +35,7 @@ final class HIDPPRequestSession {
         condition.lock()
         defer { condition.unlock() }
         guard let pendingRequest,
-              HIDPPProtocol.matchesResponse(report, request: pendingRequest.header) else {
+              pendingRequest.expectedResponse.matches(report) else {
             return false
         }
         self.pendingRequest?.response = report
@@ -66,7 +80,7 @@ final class HIDPPRequestSession {
         // Publish the expected header before writing. A fast channel can reply
         // synchronously from IOKit immediately after SetReport returns.
         condition.lock()
-        pendingRequest = PendingRequest(header: header)
+        pendingRequest = PendingRequest(expectedResponse: .long(header))
         condition.unlock()
 
         let result: IOReturn = report.withUnsafeBytes { rawBuffer in
@@ -101,7 +115,7 @@ final class HIDPPRequestSession {
 
         let deadline = Date(timeIntervalSinceNow: timeout)
         condition.lock()
-        while pendingRequest?.response == nil {
+        while let pendingRequest, pendingRequest.response == nil {
             if !condition.wait(until: deadline) { break }
         }
         let response = pendingRequest?.response
@@ -131,6 +145,109 @@ final class HIDPPRequestSession {
                 "hidpp_response",
                 response.map { String(format: "%02x", $0) }.joined()
             )
+        }
+        return response
+    }
+
+    /// Sends a HID++ 1.0 short-register request through the same pending slot
+    /// as HID++ 2.0 commands. Receiver register responses have no software ID,
+    /// so sharing this serialized session is required for unambiguous matching.
+    func sendShortRegister(
+        device: IOHIDDevice,
+        subID: UInt8,
+        address: UInt8,
+        parameters: [UInt8],
+        timeout: TimeInterval,
+        log: (String, String) -> Void
+    ) throws -> [UInt8] {
+        let header = HIDPPProtocol.ShortRegisterRequestHeader(
+            deviceIndex: HIDPPProtocol.receiverDeviceIndex,
+            subID: subID,
+            address: address
+        )
+        let report = HIDPPProtocol.makeShortRegisterRequest(
+            header: header,
+            parameters: parameters
+        )
+
+        condition.lock()
+        pendingRequest = PendingRequest(expectedResponse: .shortRegister(header))
+        condition.unlock()
+
+        log(
+            "hidpp_short_request",
+            String(
+                format: "device=0x%02x sub_id=0x%02x register=0x%02x parameters=%@ raw=%@",
+                header.deviceIndex,
+                subID,
+                address,
+                parameters.map { String(format: "%02x", $0) }.joined(),
+                report.map { String(format: "%02x", $0) }.joined()
+            )
+        )
+
+        let result: IOReturn = report.withUnsafeBytes { rawBuffer in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            guard let baseAddress = bytes.baseAddress else { return kIOReturnBadArgument }
+            return IOHIDDeviceSetReport(
+                device,
+                kIOHIDReportTypeOutput,
+                CFIndex(HIDPPProtocol.shortReportID),
+                baseAddress,
+                report.count
+            )
+        }
+        guard result == kIOReturnSuccess else {
+            cancel()
+            log(
+                "hidpp_short_write_failed",
+                String(
+                    format: "sub_id=0x%02x register=0x%02x result=0x%08x",
+                    subID,
+                    address,
+                    result
+                )
+            )
+            throw HIDPPControllerError.writeFailed(result)
+        }
+
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        condition.lock()
+        while let pendingRequest, pendingRequest.response == nil {
+            if !condition.wait(until: deadline) { break }
+        }
+        let response = pendingRequest?.response
+        pendingRequest = nil
+        condition.unlock()
+
+        guard let response else {
+            log(
+                "hidpp_short_request_timeout",
+                String(
+                    format: "device=0x%02x sub_id=0x%02x register=0x%02x timeout=%.3f",
+                    header.deviceIndex,
+                    subID,
+                    address,
+                    timeout
+                )
+            )
+            throw HIDPPControllerError.timeout
+        }
+        log(
+            "hidpp_short_response",
+            String(
+                format: "sub_id=0x%02x register=0x%02x raw=%@",
+                subID,
+                address,
+                response.map { String(format: "%02x", $0) }.joined()
+            )
+        )
+        if let error = HIDPPProtocol.shortRegisterErrorCode(in: response) {
+            log(
+                "hidpp_short_error_response",
+                String(format: "sub_id=0x%02x register=0x%02x error=0x%02x", subID, address, error)
+            )
+            throw HIDPPControllerError.deviceError(error)
         }
         return response
     }

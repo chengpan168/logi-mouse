@@ -1,6 +1,6 @@
 import Foundation
 
-struct HIDPPWheelEvent: Equatable {
+struct HIDPPWheelEvent: Equatable, Sendable {
     /// Receiver slot or 0xff direct-Bluetooth route copied from report byte 1.
     let deviceIndex: UInt8
     /// Runtime index of feature 0x2121, not the stable feature ID itself.
@@ -13,7 +13,7 @@ struct HIDPPWheelEvent: Equatable {
     let delta: Int
 }
 
-struct HIDPPThumbwheelEvent: Equatable {
+struct HIDPPThumbwheelEvent: Equatable, Sendable {
     let deviceIndex: UInt8
     let featureIndex: UInt8
     /// Signed raw horizontal rotation from feature 0x2150.
