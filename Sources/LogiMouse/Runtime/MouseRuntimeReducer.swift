@@ -17,6 +17,7 @@ enum MouseRuntimeEvent: Sendable {
 
     case controllerState(HIDPPController.State, generation: UInt64)
     case takeoverIntentChanged(Bool)
+    case takeoverRecoveryRequested
     case takeoverStarted(generation: UInt64)
     case takeoverSucceeded(generation: UInt64)
     case takeoverFailed(message: String, recoveryAttempt: Int?, generation: UInt64)
@@ -60,10 +61,7 @@ struct MouseRuntimeReducer {
         case let .monitoringStarted(generation):
             guard generation == state.generation else { return [] }
             switch state.lifecycle {
-            case .starting:
-                state.lifecycle = .running
-                return []
-            case .waking:
+            case .starting, .waking:
                 state.lifecycle = .running
                 // A synchronous IOHID match may have published deviceReady
                 // inside startMonitoring, before monitoringStarted arrives.
@@ -169,6 +167,10 @@ struct MouseRuntimeReducer {
             if !requested { state.verifiedAxes = .none }
             return []
 
+        case .takeoverRecoveryRequested:
+            guard state.isRunning, state.takeoverRequested else { return [] }
+            return [.recoverTakeover(attempt: 1, generation: state.generation)]
+
         case let .takeoverStarted(generation):
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
             state.device = .configuring(state.selectedTransport)
@@ -218,7 +220,8 @@ struct MouseRuntimeReducer {
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
             state.device = .waitingForEvent(message)
             state.verifiedAxes = .none
-            return []
+            guard state.takeoverRequested, state.isRunning else { return [] }
+            return [.recoverTakeover(attempt: 1, generation: generation)]
 
         case let .restorationStarted(generation):
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }

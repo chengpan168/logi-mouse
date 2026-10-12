@@ -6,7 +6,6 @@ final class MouseManagerWindowController: NSWindowController {
     /// presence, HID++ readiness and power transitions must not be managed by
     /// independent UI monitors, or they can disagree after system wake.
     private let coordinator = MouseRuntimeCoordinator()
-    private let preferences = MouseUserPreferences()
 
     private let deviceIcon = NSImageView()
     private let deviceNameLabel = NSTextField(labelWithString: "未检测到设备")
@@ -27,9 +26,6 @@ final class MouseManagerWindowController: NSWindowController {
     private var detectedConnection: MouseConnection = .disconnected
     private var runtimeConnectionUnavailable = false
     private var smoothTransitionInProgress = false
-    /// A persisted ON preference waits for real HID++ readiness instead of
-    /// failing merely because IOKit has not republished the mouse at launch.
-    private var automaticSmoothRestorePending = false
     private var batteryState = HIDPPBatteryState.unavailable
 
     init() {
@@ -43,7 +39,6 @@ final class MouseManagerWindowController: NSWindowController {
         window.minSize = NSSize(width: 620, height: 380)
         window.center()
         super.init(window: window)
-        automaticSmoothRestorePending = loadSmoothScrollingEnabled()
         buildInterface()
         wireCallbacks()
     }
@@ -63,15 +58,10 @@ final class MouseManagerWindowController: NSWindowController {
         coordinator.setDirection(direction)
         RuntimeLog.info(
             "preferences",
-            "Restoring user settings direction=\(direction.rawValue) smoothScrolling=\(automaticSmoothRestorePending)"
+            "Restoring user settings direction=\(direction.rawValue) smoothScrolling=\(coordinator.isTakeoverEnabled)"
         )
         do {
             try coordinator.start()
-            if automaticSmoothRestorePending {
-                smoothScrollingSwitch.state = .on
-                statusLabel.stringValue = "正在等待鼠标通道，随后自动恢复平滑滚动…"
-                attemptAutomaticSmoothRestore()
-            }
             updateSmoothControlAvailability()
         } catch {
             statusLabel.stringValue = error.localizedDescription
@@ -114,7 +104,7 @@ final class MouseManagerWindowController: NSWindowController {
 
         updateConnectionUI(.disconnected)
         updateDirectionUI(loadDirection())
-        smoothScrollingSwitch.state = automaticSmoothRestorePending ? .on : .off
+        smoothScrollingSwitch.state = coordinator.isTakeoverEnabled ? .on : .off
         updateSmoothControlAvailability()
     }
 
@@ -223,10 +213,11 @@ final class MouseManagerWindowController: NSWindowController {
             // deliberately not inferred from this visual state.
             if !state.isRunning {
                 self.smoothTransitionInProgress = false
+            }
+            if !self.smoothTransitionInProgress {
                 self.smoothScrollingSwitch.state = state.takeoverRequested ? .on : .off
             }
             self.updateSmoothControlAvailability()
-            self.attemptAutomaticSmoothRestore()
         }
         coordinator.onStatusChange = { [weak self] status in
             DispatchQueue.main.async { self?.statusLabel.stringValue = status }
@@ -266,7 +257,6 @@ final class MouseManagerWindowController: NSWindowController {
             case .discovering:
                 break
             }
-            self.attemptAutomaticSmoothRestore()
         }
         coordinator.onBatteryStateChange = { [weak self] state in
             self?.batteryState = state
@@ -276,74 +266,46 @@ final class MouseManagerWindowController: NSWindowController {
 
     @objc private func toggleSmoothScrolling(_ sender: NSSwitch) {
         if sender.state == .on {
-            enableSmoothScrolling(automatic: false)
+            enableSmoothScrolling()
         } else {
             disableSmoothScrolling()
         }
     }
 
-    private func enableSmoothScrolling(automatic: Bool) {
+    private func enableSmoothScrolling() {
         guard coordinator.isRunning else {
             smoothScrollingSwitch.state = .off
-            if !automatic { showError("滚动服务尚未运行，请检查输入监控权限。") }
+            showError("滚动服务尚未运行，请检查输入监控权限。")
             return
         }
-        guard automatic || connection.supportsSmoothScrolling else {
+        guard connection.supportsSmoothScrolling else {
             smoothScrollingSwitch.state = .off
             showError("未检测到支持 HID++ 平滑滚动的 Logitech 鼠标。")
             return
         }
 
-        automaticSmoothRestorePending = false
         setSmoothTransition(true)
-        do {
-            try coordinator.setLiveModelEnabled(true, direction: selectedDirection)
-        } catch {
-            finishSmoothEnable(.failure(error), automatic: automatic)
-            return
-        }
         coordinator.setTakeoverEnabled(true) { [weak self] result in
-            self?.finishSmoothEnable(result, automatic: automatic)
+            self?.finishSmoothEnable(result)
         }
     }
 
-    private func finishSmoothEnable(
-        _ result: Result<HIDPPController.State, Error>,
-        automatic: Bool
-    ) {
+    private func finishSmoothEnable(_ result: Result<HIDPPController.State, Error>) {
+        smoothScrollingSwitch.state = coordinator.isTakeoverEnabled ? .on : .off
         switch result {
         case .success:
-            smoothScrollingSwitch.state = .on
             statusLabel.stringValue = "平滑滚动已开启"
-            saveSmoothScrollingEnabled(true)
-            RuntimeLog.notice("preferences", "Smooth scrolling enabled and persisted automatic=\(automatic)")
+        case .failure(HIDPPControllerError.transportChanged):
+            statusLabel.stringValue = "设备连接已变化，正在重新恢复平滑滚动…"
         case let .failure(error):
-            try? coordinator.setLiveModelEnabled(false, direction: selectedDirection)
-            if automatic {
-                // Keep the saved user intent. A later deviceReady event (for
-                // example after the mouse radio wakes) will retry once.
-                automaticSmoothRestorePending = true
-                smoothScrollingSwitch.state = .on
-                statusLabel.stringValue = "自动恢复失败，等待鼠标重新连接：\(error.localizedDescription)"
-                RuntimeLog.warning(
-                    "preferences",
-                    "Automatic smooth scrolling restore deferred error=\(error.localizedDescription)"
-                )
-            } else {
-                smoothScrollingSwitch.state = .off
-                statusLabel.stringValue = error.localizedDescription
-                showError(error.localizedDescription)
-            }
+            statusLabel.stringValue = error.localizedDescription
+            showError(error.localizedDescription)
         }
         setSmoothTransition(false)
     }
 
     private func disableSmoothScrolling() {
         setSmoothTransition(true)
-        guard coordinator.isTakeoverEnabled else {
-            finishSmoothDisable()
-            return
-        }
         coordinator.setTakeoverEnabled(false) { [weak self] result in
             guard let self else { return }
             switch result {
@@ -359,18 +321,14 @@ final class MouseManagerWindowController: NSWindowController {
     }
 
     private func finishSmoothDisable() {
-        automaticSmoothRestorePending = false
-        try? coordinator.setLiveModelEnabled(false, direction: selectedDirection)
         smoothScrollingSwitch.state = .off
         statusLabel.stringValue = "平滑滚动已关闭，已恢复系统原生滚动"
-        saveSmoothScrollingEnabled(false)
         RuntimeLog.notice("preferences", "Smooth scrolling disabled and persisted")
         setSmoothTransition(false)
     }
 
     @objc private func changeDirection(_ sender: NSSegmentedControl) {
         let direction = selectedDirection
-        preferences.scrollDirection = direction
         RuntimeLog.notice("preferences", "Scroll direction persisted value=\(direction.rawValue)")
         coordinator.setDirection(direction)
         statusLabel.stringValue = direction == .natural ? "已切换为自然滚动" : "已切换为标准滚动"
@@ -381,31 +339,7 @@ final class MouseManagerWindowController: NSWindowController {
     }
 
     private func loadDirection() -> ScrollDirectionMapping {
-        preferences.scrollDirection
-    }
-
-    private func loadSmoothScrollingEnabled() -> Bool {
-        preferences.smoothScrollingEnabled
-    }
-
-    private func saveSmoothScrollingEnabled(_ enabled: Bool) {
-        preferences.smoothScrollingEnabled = enabled
-    }
-
-    private func attemptAutomaticSmoothRestore() {
-        guard automaticSmoothRestorePending,
-              !smoothTransitionInProgress,
-              coordinator.isRunning else { return }
-        switch coordinator.runtimeState.device {
-        case .deviceReady, .ready:
-            RuntimeLog.notice(
-                "preferences",
-                "Attempting automatic smooth scrolling restore generation=\(coordinator.runtimeState.generation)"
-            )
-            enableSmoothScrolling(automatic: true)
-        default:
-            break
-        }
+        coordinator.scrollDirection
     }
 
     private func updateDirectionUI(_ direction: ScrollDirectionMapping) {

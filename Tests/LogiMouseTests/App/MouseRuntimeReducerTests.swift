@@ -1,8 +1,52 @@
 import Testing
+import Foundation
 @testable import LogiMouse
 
 @Test func readinessProbeUsesRequestedBoundedDelays() {
     #expect(HIDPPDeviceServiceCoordinator.readinessProbeDelays == [0, 1, 2, 3])
+}
+
+@Test func savedIntentRecoversAfterReadinessArrivesDuringStartup() {
+    var reducer = MouseRuntimeReducer()
+    var state = MouseRuntimeState(takeoverRequested: true)
+    _ = reducer.reduce(state: &state, event: .startRequested)
+    #expect(reducer.reduce(state: &state, event: .controllerState(
+        .deviceReady(.bluetooth), generation: 1
+    )).isEmpty)
+    #expect(reducer.reduce(state: &state, event: .monitoringStarted(generation: 1)) == [
+        .recoverTakeover(attempt: 1, generation: 1)
+    ])
+}
+
+@Test func failedVerificationUsesTheSameBoundedRecoveryPath() {
+    var reducer = MouseRuntimeReducer()
+    var state = MouseRuntimeState(
+        lifecycle: .running, device: .verifying(.bluetooth),
+        takeoverRequested: true, generation: 1
+    )
+    #expect(reducer.reduce(state: &state, event: .verificationFailed(
+        message: "timeout", generation: 1
+    )) == [.recoverTakeover(attempt: 1, generation: 1)])
+    _ = reducer.reduce(state: &state, event: .takeoverIntentChanged(false))
+    #expect(reducer.reduce(state: &state, event: .verificationFailed(
+        message: "timeout", generation: 1
+    )).isEmpty)
+}
+
+@Test @MainActor func coordinatorOwnsSavedIntentAndAllowsDisableBeforeReadiness() throws {
+    let suite = "test.runtime-intent.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let preferences = MouseUserPreferences(defaults: defaults)
+    preferences.smoothScrollingEnabled = true
+    let coordinator = MouseRuntimeCoordinator(preferences: preferences)
+    #expect(coordinator.isTakeoverEnabled)
+    #expect(!coordinator.runtimeState.outputIsVerified(for: .vertical))
+    coordinator.setTakeoverEnabled(false) { result in
+        #expect(throws: Never.self) { try result.get() }
+    }
+    #expect(!coordinator.isTakeoverEnabled)
+    #expect(!preferences.smoothScrollingEnabled)
 }
 
 @Test func sleepInvalidatesHardwareEvidenceButPreservesUserIntent() {

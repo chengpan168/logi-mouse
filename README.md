@@ -36,6 +36,10 @@ open .build/logi-mouse.app
 
 `MouseRuntimeCoordinator` 是应用内唯一的运行时状态所有者。系统睡眠/唤醒、设备插拔、用户开关、HID++ 命令结果和恢复定时器都先转换成事件，再由纯 reducer 计算新状态和待执行副作用。
 
+用户开关和方向由 coordinator 统一保存和恢复；窗口只展示状态、提交操作。启动、唤醒、重连和模式校验失败都使用同一条有界接管恢复路径，HID++ controller 不自行调度重新接管。
+
+每个硬件事务固定物理通道和路由版本，发送前后、会话状态提交及主队列回调交付时都会检查版本。模式校验失败只清除可信度，保留待恢复快照；接管失败会尝试恢复两个滚轮，恢复失败的轴保留快照供后续关闭或退出重试。
+
 ![MouseRuntimeCoordinator 完整状态流转图](docs/mouse-runtime-coordinator-state-machine.svg)
 
 图中需要区分三类信息：
@@ -285,7 +289,7 @@ SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/module-cache" \
 .build/logi-mouse.app
 ```
 
-当前产品测试集包含曲线计算、衰减、低速量化下限、误差扩散、方向反转、Bluetooth 批量 periods 与 USB 单周期等价性、连接方式识别、Bluetooth 直连路由、C 层报告过滤、Receiver 连接通知、分轴接管安全门、滚动事件关联和按需校验限频，以及主滚轮/横向轮请求构造、事件解码、响应匹配、动态 feature、模式位解析和原生恢复等 30 项测试。
+当前产品测试集包含曲线计算、衰减、低速量化下限、误差扩散、方向反转、Bluetooth 批量 periods 与 USB 单周期等价性、连接方式识别、Bluetooth 直连路由、C 层报告过滤、Receiver 连接通知、分轴接管安全门、滚动事件关联和按需校验限频，以及主滚轮/横向轮请求构造、事件解码、响应匹配、动态 feature、模式位解析和原生恢复。控制器事务测试通过模拟硬件验证校验超时后的恢复、写入应答丢失时的双轴回滚、回滚失败后的再次恢复和事务期间路由切换。
 
 当前机器的 `xcode-select` 指向 Command Line Tools，而其 SDK 与系统 Swift 小版本不匹配。因此构建脚本和上面的测试命令都显式使用 `/Applications/Xcode.app` 工具链，无需修改全局 `xcode-select`。
 
@@ -311,7 +315,7 @@ export LOGI_MOUSE_NOTARY_PROFILE='logi-mouse-notary'
 4. 修改权限后完全退出并重新打开应用。
 5. 主界面会显示当前设备连接方式；USB Receiver 与受支持的 MX Master Bluetooth 连接都可以开启平滑滚动。
 6. 使用“自然滚动 / 标准滚动”分段按钮切换方向，选择会被保存。
-7. 打开“平滑滚动”总开关后，应用会依次启用模型、接管并校验当前 HID++ 通道、开启全局输出，不再需要手工组合多个实验开关。
+7. 打开“平滑滚动”总开关后，应用记录接管意图，接管并校验当前 HID++ 通道；只有对应轴校验成功且设备就绪后才开启模型输出。
 8. 出现异常时可立即关闭总开关或按 `Command-Q`。关闭或退出应用都会恢复接管前的硬件模式。
 
 应用提供标准的 `Quit logi-mouse` 菜单项；点击菜单或按 `Command-Q` 都会先执行同步模式恢复，再结束进程。

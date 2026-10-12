@@ -157,37 +157,44 @@ final class HIDPPController {
         let restoreInverted: Bool
     }
 
-    private struct Channel {
-        /// IOHIDDevice used by IOHIDDeviceSetReport for output commands.
-        let device: IOHIDDevice
-        /// In-process identity shared with HIDMonitor callback routing.
-        let key: UInt
-        let transport: HIDPPTransport
-    }
 
     /// Serializes hardware requests, mode transactions and explicit verification.
-    private let operationQueue = DispatchQueue(label: "dev.logi-mouse.hidpp-controller")
+    private let operationQueue: DispatchQueue
     private let requestSession = HIDPPRequestSession()
-    private lazy var deviceServices = HIDPPDeviceServiceCoordinator(operationQueue: operationQueue)
+    private let deviceServices: HIDPPDeviceServiceCoordinator
     /// Protects routing and mode state touched by IOKit and operationQueue.
     private let stateLock = NSLock()
-    private var channels: [UInt: Channel] = [:]
-    private var selectedChannelKey: UInt?
-    /// Per-slot link edge state used to ignore repeated Receiver 0x41/0x40
-    /// notifications until an actual offline/online transition occurs.
-    private var receiverConnectionEdges = ReceiverConnectionEdgeTracker()
-    /// Receiver slot seen in notifications/events; Bluetooth is always 0xff.
-    private var observedDeviceIndex: UInt8?
-    /// Per-device runtime addresses returned by Root Feature discovery.
-    private var featureIndices: [UInt8: UInt8] = [:]
-    private var thumbwheelFeatureIndices: [UInt8: UInt8] = [:]
-    private var batteryFeatures: [UInt8: HIDPPProtocol.BatteryFeature] = [:]
-    private var activeWheel: ActiveWheel?
-    private var activeThumbwheel: ActiveThumbwheel?
-    private var verifiedTakeoverAxes = HIDPPTakeoverAxes.none
-    private var takeoverRequested = false
-    private var reacquireAttemptScheduled = false
-    private var routeGeneration: UInt64 = 0
+    private var channels: [UInt: HIDPPCommandChannel] = [:]
+    private struct HardwareSession {
+        var generation: UInt64 = 0
+        var channelKey: UInt?
+        var receiverConnectionEdges = ReceiverConnectionEdgeTracker()
+        var observedDeviceIndex: UInt8?
+        var featureIndices: [UInt8: UInt8] = [:]
+        var thumbwheelFeatureIndices: [UInt8: UInt8] = [:]
+        var batteryFeatures: [UInt8: HIDPPProtocol.BatteryFeature] = [:]
+        // Pending restoration survives verification failure until restore succeeds.
+        var activeWheel: ActiveWheel?
+        var activeThumbwheel: ActiveThumbwheel?
+        var verifiedTakeoverAxes = HIDPPTakeoverAxes.none
+    }
+
+    private struct Route {
+        let channel: HIDPPCommandChannel
+        let generation: UInt64
+    }
+
+    private var session = HardwareSession()
+    // Confined to operationQueue; every request in a transaction uses this route.
+    private var operationRoute: Route?
+    private let operationQueueKey = DispatchSpecificKey<Void>()
+
+    init() {
+        let queue = DispatchQueue(label: "dev.logi-mouse.hidpp-controller")
+        operationQueue = queue
+        deviceServices = HIDPPDeviceServiceCoordinator(operationQueue: queue)
+        operationQueue.setSpecific(key: operationQueueKey, value: ())
+    }
 
     // MARK: - HID++ channel lifecycle
 
@@ -199,16 +206,38 @@ final class HIDPPController {
         key: UInt,
         transport: HIDPPTransport
     ) {
+        let requestSession = requestSession
+        let log: (String, String) -> Void = { [weak self] layer, message in
+            self?.log(layer, message)
+        }
+        considerChannel(HIDPPCommandChannel(key: key, transport: transport) { request in
+            switch request {
+            case let .feature(index, feature, function, payload, timeout, quietly):
+                return try requestSession.send(
+                    device: device, transport: transport, deviceIndex: index,
+                    featureIndex: feature, functionID: function, payload: payload,
+                    timeout: timeout, quietly: quietly, log: log
+                )
+            case let .receiverRegister(subID, address, parameters, timeout):
+                return try requestSession.sendShortRegister(
+                    device: device, subID: subID, address: address,
+                    parameters: parameters, timeout: timeout, log: log
+                )
+            }
+        })
+    }
+
+    func considerChannel(_ channel: HIDPPCommandChannel) {
         stateLock.lock()
-        channels[key] = Channel(device: device, key: key, transport: transport)
-        let previousKey = selectedChannelKey
-        selectedChannelKey = preferredChannelKeyLocked()
+        channels[channel.key] = channel
+        let previousKey = session.channelKey
+        session.channelKey = preferredChannelKeyLocked()
         let selected = selectedChannelLocked()
-        let channelChanged = previousKey != selectedChannelKey
+        let channelChanged = previousKey != session.channelKey
         if channelChanged {
             resetRouteStateLocked(for: selected?.transport)
         }
-        let selectedRouteGeneration = routeGeneration
+        let selectedRouteGeneration = session.generation
         stateLock.unlock()
 
         if channelChanged { publishTakeoverAxes(.none) }
@@ -219,7 +248,7 @@ final class HIDPPController {
         log("hidpp_controller_device", "selected \(selected.transport) HID++ channel")
         prepareSelectedChannel(
             selected,
-            routeGeneration: selectedRouteGeneration
+            generation: selectedRouteGeneration
         )
     }
 
@@ -228,14 +257,14 @@ final class HIDPPController {
     /// instead of immediately scanning dormant slots in a loop.
     func removeDevice(key: UInt) {
         stateLock.lock()
-        let wasSelected = selectedChannelKey == key
+        let wasSelected = session.channelKey == key
         channels.removeValue(forKey: key)
         if wasSelected {
-            selectedChannelKey = preferredChannelKeyLocked()
+            session.channelKey = preferredChannelKeyLocked()
         }
         let replacement = selectedChannelLocked()
         if wasSelected { resetRouteStateLocked(for: replacement?.transport) }
-        let replacementRouteGeneration = routeGeneration
+        let replacementRouteGeneration = session.generation
         stateLock.unlock()
 
         if wasSelected {
@@ -247,7 +276,7 @@ final class HIDPPController {
                 log("hidpp_controller_device", "fell back to \(replacement.transport) HID++ channel")
                 prepareSelectedChannel(
                     replacement,
-                    routeGeneration: replacementRouteGeneration
+                    generation: replacementRouteGeneration
                 )
             } else {
                 transition(to: .unavailable)
@@ -268,7 +297,7 @@ final class HIDPPController {
               report.first == HIDPPProtocol.longReportID,
               report[3] == 0 else { return false }
         stateLock.lock()
-        let batteryFeature = batteryFeatures[report[1]]
+        let batteryFeature = session.batteryFeatures[report[1]]
         stateLock.unlock()
         guard batteryFeature?.index == report[2],
               let batteryFeature,
@@ -289,7 +318,7 @@ final class HIDPPController {
         event: HIDPPProtocol.ReceiverConnectionEvent
     ) {
         stateLock.lock()
-        let isSelectedReceiver = selectedChannelKey == deviceKey
+        let isSelectedReceiver = session.channelKey == deviceKey
             && channels[deviceKey]?.transport == .usbReceiver
         guard isSelectedReceiver else {
             stateLock.unlock()
@@ -316,8 +345,8 @@ final class HIDPPController {
             )
             return
         }
-        if !event.isConnected, observedDeviceIndex != event.deviceIndex {
-            let observed = observedDeviceIndex.map(String.init) ?? "none"
+        if !event.isConnected, session.observedDeviceIndex != event.deviceIndex {
+            let observed = session.observedDeviceIndex.map(String.init) ?? "none"
             stateLock.unlock()
             log(
                 "hidpp_receiver_event_ignored",
@@ -330,7 +359,7 @@ final class HIDPPController {
             )
             return
         }
-        guard receiverConnectionEdges.accept(
+        guard session.receiverConnectionEdges.accept(
             deviceIndex: event.deviceIndex,
             connected: event.isConnected
         ) else {
@@ -348,19 +377,19 @@ final class HIDPPController {
         }
         var readyGeneration: UInt64?
         if event.isConnected {
-            observedDeviceIndex = event.deviceIndex
-            readyGeneration = routeGeneration
+            session.observedDeviceIndex = event.deviceIndex
+            readyGeneration = session.generation
         }
         if !event.isConnected {
-            activeWheel = nil
-            activeThumbwheel = nil
-            featureIndices.removeAll()
-            thumbwheelFeatureIndices.removeAll()
-            batteryFeatures.removeAll()
-            verifiedTakeoverAxes = .none
-            routeGeneration &+= 1
+            session.activeWheel = nil
+            session.activeThumbwheel = nil
+            session.featureIndices.removeAll()
+            session.thumbwheelFeatureIndices.removeAll()
+            session.batteryFeatures.removeAll()
+            session.verifiedTakeoverAxes = .none
+            session.generation &+= 1
         }
-        let routeGenerationSnapshot = routeGeneration
+        let routeGenerationSnapshot = session.generation
         stateLock.unlock()
 
         if !event.isConnected { publishTakeoverAxes(.none) }
@@ -401,15 +430,15 @@ final class HIDPPController {
 
     func observeWheelRoute(deviceIndex: UInt8, featureIndex: UInt8) {
         stateLock.lock()
-        observedDeviceIndex = deviceIndex
-        featureIndices[deviceIndex] = featureIndex
+        session.observedDeviceIndex = deviceIndex
+        session.featureIndices[deviceIndex] = featureIndex
         stateLock.unlock()
     }
 
     func observeThumbwheelRoute(deviceIndex: UInt8, featureIndex: UInt8) {
         stateLock.lock()
-        observedDeviceIndex = deviceIndex
-        thumbwheelFeatureIndices[deviceIndex] = featureIndex
+        session.observedDeviceIndex = deviceIndex
+        session.thumbwheelFeatureIndices[deviceIndex] = featureIndex
         stateLock.unlock()
     }
 
@@ -418,27 +447,9 @@ final class HIDPPController {
     func verifyMode(
         completion: @escaping (Result<HIDPPTakeoverAxes, Error>) -> Void = { _ in }
     ) {
-        operationQueue.async { [weak self] in
-            guard let self else { return }
-            guard self.isTakeoverRequested else {
-                DispatchQueue.main.async {
-                    completion(.failure(HIDPPControllerError.deviceNotFound))
-                }
-                return
-            }
-            guard self.hasActiveWheel else {
-                self.scheduleReacquire(after: 0)
-                DispatchQueue.main.async {
-                    completion(.failure(HIDPPControllerError.deviceNotFound))
-                }
-                return
-            }
-            do {
-                let axes = try self.verifyActiveMode()
-                DispatchQueue.main.async { completion(.success(axes)) }
-            } catch {
-                DispatchQueue.main.async { completion(.failure(error)) }
-            }
+        runOperation(completion: completion) {
+            guard self.hasActiveWheel else { throw HIDPPControllerError.deviceNotFound }
+            return try self.verifyActiveMode()
         }
     }
 
@@ -451,107 +462,78 @@ final class HIDPPController {
     func featureIndex(for deviceIndex: UInt8) -> UInt8? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return featureIndices[deviceIndex]
+        return session.featureIndices[deviceIndex]
     }
 
     func thumbwheelFeatureIndex(for deviceIndex: UInt8) -> UInt8? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return thumbwheelFeatureIndices[deviceIndex]
+        return session.thumbwheelFeatureIndices[deviceIndex]
     }
 
     func acceptsDevice(key: UInt) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return selectedChannelKey == key
+        return session.channelKey == key
     }
 
     // MARK: - Public takeover lifecycle
 
     /// Begins the all-axis hardware transaction on `operationQueue`.
     /// Completion is delivered on the main queue for direct UI consumption.
-    func takeOverWheel(
-        preserveRequestOnFailure: Bool = false,
-        completion: @escaping (Result<State, Error>) -> Void
-    ) {
-        setTakeoverRequested(true)
-        operationQueue.async { [weak self] in
-            guard let self else { return }
+    func takeOverWheel(completion: @escaping (Result<State, Error>) -> Void) {
+        runOperation(completion: completion) {
             do {
-                let ready = try self.performTakeover()
-                DispatchQueue.main.async { completion(.success(ready)) }
+                return try self.performTakeover()
             } catch {
-                // A user-initiated enable failure turns intent back off. Runtime
-                // recovery is different: its application-level intent survives
-                // sleep, so keep the controller armed for a later matching or
-                // Receiver link-up event after this bounded attempt fails.
-                if !preserveRequestOnFailure {
-                    self.setTakeoverRequested(false)
-                }
-                // A SetMode request may have reached the mouse even when its
-                // response or verification read timed out. Restore the saved
-                // pre-takeover mode before reporting the failed activation.
-                if self.hasActiveWheel {
-                    do {
-                        _ = try self.performRestore()
-                    } catch {
-                        self.log("hidpp_restore_after_takeover_failure_failed", error.localizedDescription)
-                    }
+                // Saved modes exist before each write, including a write whose
+                // reply was lost. Roll back every modified axis on this route.
+                do {
+                    _ = try self.performRestore()
+                } catch {
+                    self.log("hidpp_restore_after_takeover_failure_failed", error.localizedDescription)
                 }
                 self.invalidateVerifiedTakeoverAxes()
                 self.transition(to: .failed(error.localizedDescription))
-                self.log("hidpp_takeover_failed", error.localizedDescription)
-                DispatchQueue.main.async { completion(.failure(error)) }
+                throw error
             }
         }
     }
 
     func restoreWheel(completion: @escaping (Result<State, Error>) -> Void) {
-        setTakeoverRequested(false)
-        operationQueue.async { [weak self] in
-            guard let self else { return }
+        guard let route = currentRoute() else {
+            DispatchQueue.main.async { completion(.success(.unavailable)) }
+            return
+        }
+        runOperation(route: route, completion: completion) {
             do {
-                let state = try self.performRestore()
-                DispatchQueue.main.async { completion(.success(state)) }
+                return try self.performRestore()
             } catch {
                 self.invalidateVerifiedTakeoverAxes()
                 self.transition(to: .failed(error.localizedDescription))
-                self.log("hidpp_restore_failed", error.localizedDescription)
-                DispatchQueue.main.async { completion(.failure(error)) }
+                throw error
             }
         }
     }
 
-    /// Restores hardware before process termination.
-    ///
-    /// HIDMonitor delivers input reports on its dedicated HID dispatch queue,
-    /// so waiting for the serialized operation queue cannot block the callback
-    /// that completes a restore request. Keeping this synchronous makes teardown
-    /// deterministic without pumping the AppKit run loop and dispatching mouse
-    /// events while the application is stopping.
+    /// Input replies arrive on HIDMonitor's queue while shutdown waits here.
     func restoreSynchronously() {
-        setTakeoverRequested(false)
+        guard let route = currentRoute() else { return }
         operationQueue.sync {
             do {
-                _ = try self.performRestore()
+                _ = try withRoute(route) { try performRestore() }
             } catch {
-                invalidateVerifiedTakeoverAxes()
                 log("hidpp_restore_failed", error.localizedDescription)
             }
         }
     }
 
-    /// Invalidates the complete physical session without writing to hardware.
-    ///
-    /// This is used only for system sleep. The application-level coordinator
-    /// preserves the user's takeover intent, while this controller deliberately
-    /// forgets every IOHIDDevice, route and pending request from the old power
-    /// generation. A newly created controller will rediscover them after wake.
-    func invalidateForSystemSleep() {
+    /// Closes the physical session after restoration or before sleeping. Queued
+    /// operations and main-queue publications cannot revive the retired route.
+    func invalidateSession() {
         stateLock.lock()
-        takeoverRequested = false
         channels.removeAll()
-        selectedChannelKey = nil
+        session.channelKey = nil
         resetRouteStateLocked(for: nil)
         stateLock.unlock()
 
@@ -564,20 +546,18 @@ final class HIDPPController {
 
     // MARK: - Takeover transaction
 
-    private func performTakeover(knownRouteOnly: Bool = false) throws -> State {
+    private func performTakeover() throws -> State {
         transition(to: .discovering)
         // Receiver slot numbers and feature indices can change after reconnect;
         // Bluetooth always routes directly through 0xff. Resolve both feature
         // indices on every takeover instead of persisting addresses.
-        let deviceIndex = try discoverDeviceIndex(knownRouteOnly: knownRouteOnly)
+        let deviceIndex = try discoverDeviceIndex()
         let feature = try discoverFeature(
             HIDPPProtocol.hiResWheelFeatureID,
             deviceIndex: deviceIndex,
             timeout: 0.7
         )
-        stateLock.lock()
-        featureIndices[deviceIndex] = feature.index
-        stateLock.unlock()
+        try mutateSession { $0.featureIndices[deviceIndex] = feature.index }
 
         // Transaction order is intentionally read -> save -> write -> read.
         // SetReport success confirms only USB/BLE transport delivery, not that
@@ -589,15 +569,14 @@ final class HIDPPController {
         // can reach the mouse even if its response is lost; without this early
         // snapshot an error path could leave the physical wheel diverted and
         // make native scrolling appear broken after logi-mouse exits.
-        stateLock.lock()
-        if activeWheel == nil {
-            activeWheel = ActiveWheel(
-                deviceIndex: deviceIndex,
-                featureIndex: feature.index,
-                restoreMode: originalMode.nativeTarget
-            )
+        try mutateSession {
+            if $0.activeWheel == nil {
+                $0.activeWheel = ActiveWheel(
+                    deviceIndex: deviceIndex, featureIndex: feature.index,
+                    restoreMode: originalMode.nativeTarget
+                )
+            }
         }
-        stateLock.unlock()
 
         if originalMode != desiredMode {
             let written = try setWheelMode(
@@ -620,7 +599,7 @@ final class HIDPPController {
                 actual: readBack.rawValue
             )
         }
-        setVerifiedTakeoverAxis(.vertical, enabled: true)
+        try setVerifiedTakeoverAxis(.vertical, enabled: true)
 
         // The thumbwheel is a separate physical sensor and HID++ feature with
         // separate reporting state. It cannot reuse the main wheel's feature
@@ -630,22 +609,19 @@ final class HIDPPController {
             deviceIndex: deviceIndex,
             timeout: 0.7
         )
-        stateLock.lock()
-        thumbwheelFeatureIndices[deviceIndex] = thumbwheelFeature.index
-        stateLock.unlock()
+        try mutateSession { $0.thumbwheelFeatureIndices[deviceIndex] = thumbwheelFeature.index }
         let originalThumbwheelStatus = try getThumbwheelStatus(
             deviceIndex: deviceIndex,
             featureIndex: thumbwheelFeature.index
         )
-        stateLock.lock()
-        if activeThumbwheel == nil {
-            activeThumbwheel = ActiveThumbwheel(
-                deviceIndex: deviceIndex,
-                featureIndex: thumbwheelFeature.index,
-                restoreInverted: originalThumbwheelStatus.directionInverted
-            )
+        try mutateSession {
+            if $0.activeThumbwheel == nil {
+                $0.activeThumbwheel = ActiveThumbwheel(
+                    deviceIndex: deviceIndex, featureIndex: thumbwheelFeature.index,
+                    restoreInverted: originalThumbwheelStatus.directionInverted
+                )
+            }
         }
-        stateLock.unlock()
         if originalThumbwheelStatus != .diverted {
             try setThumbwheelReporting(
                 .diverted,
@@ -663,7 +639,7 @@ final class HIDPPController {
                 actual: thumbwheelReadBack.reportingMode
             )
         }
-        setVerifiedTakeoverAxis(.horizontal, enabled: true)
+        try setVerifiedTakeoverAxis(.horizontal, enabled: true)
 
         let ready = State.ready(
             deviceIndex: deviceIndex,
@@ -684,10 +660,7 @@ final class HIDPPController {
     /// attempting both. Returning after one failed sensor would unnecessarily
     /// strand the other sensor in diverted mode.
     private func performRestore() throws -> State {
-        stateLock.lock()
-        let activeWheel = self.activeWheel
-        let activeThumbwheel = self.activeThumbwheel
-        stateLock.unlock()
+        let (activeWheel, activeThumbwheel) = try mutateSession { ($0.activeWheel, $0.activeThumbwheel) }
         guard activeWheel != nil || activeThumbwheel != nil else {
             invalidateVerifiedTakeoverAxes()
             let transport = currentTransport()
@@ -721,11 +694,11 @@ final class HIDPPController {
                         actual: readBack.reportingMode
                     )
                 }
-                stateLock.lock()
-                self.activeThumbwheel = nil
-                self.verifiedTakeoverAxes.horizontal = false
-                let axes = self.verifiedTakeoverAxes
-                stateLock.unlock()
+                let axes = try mutateSession {
+                    $0.activeThumbwheel = nil
+                    $0.verifiedTakeoverAxes.horizontal = false
+                    return $0.verifiedTakeoverAxes
+                }
                 publishTakeoverAxes(axes)
                 restoredDescriptions.append("thumbwheel={\(readBack)}")
             } catch {
@@ -755,11 +728,11 @@ final class HIDPPController {
                         actual: readBack.rawValue
                     )
                 }
-                stateLock.lock()
-                self.activeWheel = nil
-                self.verifiedTakeoverAxes.vertical = false
-                let axes = self.verifiedTakeoverAxes
-                stateLock.unlock()
+                let axes = try mutateSession {
+                    $0.activeWheel = nil
+                    $0.verifiedTakeoverAxes.vertical = false
+                    return $0.verifiedTakeoverAxes
+                }
                 publishTakeoverAxes(axes)
                 restoredDescriptions.append("wheel={\(readBack)}")
             } catch {
@@ -779,11 +752,9 @@ final class HIDPPController {
 
     // MARK: - Feature discovery and commands
 
-    private func discoverDeviceIndex(knownRouteOnly: Bool) throws -> UInt8 {
-        stateLock.lock()
-        let preferred = observedDeviceIndex
-        let directIndex = selectedChannelLocked()?.transport.directDeviceIndex
-        stateLock.unlock()
+    private func discoverDeviceIndex() throws -> UInt8 {
+        let preferred = try mutateSession { $0.observedDeviceIndex }
+        let directIndex = operationRoute?.channel.transport.directDeviceIndex
         if let directIndex {
             return directIndex
         }
@@ -794,9 +765,7 @@ final class HIDPPController {
         // wake policy may explicitly request a bounded sequence of retries.
         var candidates: [UInt8] = []
         if let preferred { candidates.append(preferred) }
-        if !knownRouteOnly || preferred == nil {
-            candidates.append(contentsOf: (1...6).map(UInt8.init))
-        }
+        candidates.append(contentsOf: (1...6).map(UInt8.init))
 
         var visited = Set<UInt8>()
         for index in candidates where visited.insert(index).inserted {
@@ -804,14 +773,12 @@ final class HIDPPController {
                 let feature = try discoverFeature(
                     HIDPPProtocol.hiResWheelFeatureID,
                     deviceIndex: index,
-                    timeout: index == preferred
-                        ? (knownRouteOnly ? 0.35 : 0.7)
-                        : 0.25
+                    timeout: index == preferred ? 0.7 : 0.25
                 )
-                stateLock.lock()
-                observedDeviceIndex = index
-                featureIndices[index] = feature.index
-                stateLock.unlock()
+                try mutateSession {
+                    $0.observedDeviceIndex = index
+                    $0.featureIndices[index] = feature.index
+                }
                 return index
             } catch HIDPPControllerError.featureUnsupported {
                 continue
@@ -861,8 +828,8 @@ final class HIDPPController {
     /// short-register replies and an early 0x40/0x41 notification cannot race
     /// ahead of callback registration.
     private func prepareSelectedChannel(
-        _ channel: Channel,
-        routeGeneration: UInt64
+        _ channel: HIDPPCommandChannel,
+        generation: UInt64
     ) {
         guard channel.transport == .usbReceiver else {
             probeDeviceReadiness()
@@ -873,7 +840,7 @@ final class HIDPPController {
             "hidpp_receiver_notifications_prepare_scheduled",
             String(
                 format: "route_generation=%llu channel_key=0x%llx",
-                routeGeneration,
+                generation,
                 channel.key
             )
         )
@@ -881,13 +848,13 @@ final class HIDPPController {
             guard let self else { return }
             guard self.selectedChannelIsCurrent(
                 key: channel.key,
-                generation: routeGeneration
+                generation: generation
             ) else {
                 self.log(
                     "hidpp_receiver_notifications_prepare_discarded",
                     String(
                         format: "route_generation=%llu channel_key=0x%llx reason=stale-route-before-start",
-                        routeGeneration,
+                        generation,
                         channel.key
                     )
                 )
@@ -895,26 +862,28 @@ final class HIDPPController {
             }
 
             do {
-                try self.enableReceiverWirelessNotifications(device: channel.device)
+                try self.withRoute(Route(channel: channel, generation: generation)) {
+                    try self.enableReceiverWirelessNotifications()
+                }
             } catch {
                 // Notification subscription improves event-driven recovery but
                 // is not a prerequisite for direct probing. Continue so older
                 // or unusual Receiver firmware retains the existing behavior.
                 self.log(
                     "hidpp_receiver_notifications_enable_failed",
-                    "route_generation=\(routeGeneration) error=\(error.localizedDescription)"
+                    "route_generation=\(generation) error=\(error.localizedDescription)"
                 )
             }
 
             guard self.selectedChannelIsCurrent(
                 key: channel.key,
-                generation: routeGeneration
+                generation: generation
             ) else {
                 self.log(
                     "hidpp_receiver_notifications_prepare_discarded",
                     String(
                         format: "route_generation=%llu channel_key=0x%llx reason=stale-route-after-configuration",
-                        routeGeneration,
+                        generation,
                         channel.key
                     )
                 )
@@ -927,14 +896,12 @@ final class HIDPPController {
     /// Enables Receiver register 0x00/r1 bit 0 with read-modify-write semantics.
     /// Other applications may own adjacent notification bits, so their values
     /// are preserved rather than replaced with a hard-coded flag set.
-    private func enableReceiverWirelessNotifications(device: IOHIDDevice) throws {
-        let initialResponse = try requestSession.sendShortRegister(
-            device: device,
+    private func enableReceiverWirelessNotifications() throws {
+        let initialResponse = try callReceiverRegister(
             subID: HIDPPProtocol.getShortRegisterSubID,
             address: HIDPPProtocol.receiverNotificationRegister,
             parameters: [0, 0, 0],
-            timeout: 0.7,
-            log: log
+            timeout: 0.7
         )
         guard let initial = HIDPPProtocol.receiverNotificationFlags(in: initialResponse) else {
             log(
@@ -951,26 +918,22 @@ final class HIDPPController {
                 "hidpp_receiver_notifications_write_requested",
                 "before={\(initial)} desired={\(desired)} preserved_other_bits=true"
             )
-            _ = try requestSession.sendShortRegister(
-                device: device,
+            _ = try callReceiverRegister(
                 subID: HIDPPProtocol.setShortRegisterSubID,
                 address: HIDPPProtocol.receiverNotificationRegister,
                 parameters: desired.parameters,
-                timeout: 0.7,
-                log: log
+                timeout: 0.7
             )
             log("hidpp_receiver_notifications_write_acknowledged", "desired={\(desired)}")
         } else {
             log("hidpp_receiver_notifications_already_enabled", "flags={\(initial)}")
         }
 
-        let verificationResponse = try requestSession.sendShortRegister(
-            device: device,
+        let verificationResponse = try callReceiverRegister(
             subID: HIDPPProtocol.getShortRegisterSubID,
             address: HIDPPProtocol.receiverNotificationRegister,
             parameters: [0, 0, 0],
-            timeout: 0.7,
-            log: log
+            timeout: 0.7
         )
         guard let verified = HIDPPProtocol.receiverNotificationFlags(in: verificationResponse) else {
             log(
@@ -1002,58 +965,61 @@ final class HIDPPController {
             stateLock.unlock()
             log(
                 "hidpp_readiness_probe_skipped",
-                "reason=no-selected-channel takeover_requested=\(isTakeoverRequested)"
+                "reason=no-selected-channel has_restore_snapshot=\(hasActiveWheel)"
             )
             return
         }
-        let generation = routeGeneration
-        let observedDeviceIndex = observedDeviceIndex
-        let requested = takeoverRequested
+        let generation = session.generation
+        let observedDeviceIndexSnapshot = session.observedDeviceIndex
+        let hasRestoreSnapshot = session.activeWheel != nil
         stateLock.unlock()
-        let observedDeviceDescription = observedDeviceIndex.map(String.init) ?? "none"
+        let observedDeviceDescription = observedDeviceIndexSnapshot.map(String.init) ?? "none"
 
         log(
             "hidpp_readiness_probe_requested",
             "route_generation=\(generation) transport=\(selectedChannel.transport) "
                 + "observed_device=\(observedDeviceDescription) "
-                + "takeover_requested=\(requested)"
+                + "has_restore_snapshot=\(hasRestoreSnapshot)"
         )
 
         deviceServices.probeReadiness(
             generation: generation,
             operation: { [weak self] in
                 guard let self else { throw HIDPPControllerError.noHIDPPChannel }
-                let deviceIndex = try self.discoverDeviceIndex(knownRouteOnly: false)
-                guard let transport = self.currentTransport() else {
-                    throw HIDPPControllerError.noHIDPPChannel
+                return try self.withRoute(Route(channel: selectedChannel, generation: generation)) {
+                    let deviceIndex = try self.discoverDeviceIndex()
+                    return HIDPPReadyDevice(deviceIndex: deviceIndex, transport: selectedChannel.transport)
                 }
-                return HIDPPReadyDevice(deviceIndex: deviceIndex, transport: transport)
             },
             isCurrent: { [weak self] generation in
                 self?.routeIsCurrent(generation) ?? false
             },
             onReady: { [weak self] device, attempt in
                 guard let self else { return }
-                self.transition(to: .deviceReady(device.transport))
+                self.publish(generation: generation) {
+                    $0.onStateChange?(.deviceReady(device.transport))
+                }
                 self.log(
                     "hidpp_device_ready",
                     "device=\(device.deviceIndex) transport=\(device.transport) attempt=\(attempt)"
                 )
-                self.refreshBattery(after: 0, deviceIndex: device.deviceIndex)
+                self.refreshBattery(
+                    after: 0, deviceIndex: device.deviceIndex, expectedGeneration: generation
+                )
             },
             onLog: { [weak self] layer, message in
                 guard let self else { return }
                 self.stateLock.lock()
-                let currentGeneration = self.routeGeneration
+                let currentGeneration = self.session.generation
                 let transport = self.selectedChannelLocked()?.transport.description ?? "none"
-                let observedDevice = self.observedDeviceIndex.map(String.init) ?? "none"
-                let requested = self.takeoverRequested
+                let observedDevice = self.session.observedDeviceIndex.map(String.init) ?? "none"
+                let hasRestoreSnapshot = self.session.activeWheel != nil
                 self.stateLock.unlock()
                 self.log(
                     layer,
                     "\(message) current_route_generation=\(currentGeneration) "
                         + "selected_transport=\(transport) observed_device=\(observedDevice) "
-                        + "takeover_requested=\(requested)"
+                        + "has_restore_snapshot=\(hasRestoreSnapshot)"
                 )
             }
         )
@@ -1061,14 +1027,22 @@ final class HIDPPController {
 
     // MARK: - Battery
 
-    private func refreshBattery(after delay: TimeInterval, deviceIndex: UInt8? = nil) {
+    private func refreshBattery(
+        after delay: TimeInterval,
+        deviceIndex: UInt8? = nil,
+        expectedGeneration: UInt64? = nil
+    ) {
         stateLock.lock()
-        guard selectedChannelLocked() != nil else {
+        if let expectedGeneration, session.generation != expectedGeneration {
+            stateLock.unlock()
+            return
+        }
+        guard let channel = selectedChannelLocked() else {
             stateLock.unlock()
             publishBatteryState(.unavailable)
             return
         }
-        let generation = routeGeneration
+        let generation = session.generation
         stateLock.unlock()
 
         deviceServices.refreshBattery(
@@ -1076,31 +1050,31 @@ final class HIDPPController {
             delay: delay,
             operation: { [weak self] in
                 guard let self else { throw HIDPPControllerError.noHIDPPChannel }
-                let resolvedDeviceIndex = try deviceIndex
-                    ?? self.discoverDeviceIndex(knownRouteOnly: false)
-                return try self.readBattery(deviceIndex: resolvedDeviceIndex)
+                return try self.withRoute(Route(channel: channel, generation: generation)) {
+                    let resolvedDeviceIndex = try deviceIndex
+                        ?? self.discoverDeviceIndex()
+                    return try self.readBattery(deviceIndex: resolvedDeviceIndex)
+                }
             },
             isCurrent: { [weak self] generation in
                 self?.routeIsCurrent(generation) ?? false
             },
-            onState: { [weak self] state in self?.publishBatteryState(state) },
+            onState: { [weak self] state in
+                self?.publish(generation: generation) { $0.onBatteryStateChange?(state) }
+            },
             onLog: { [weak self] layer, message in self?.log(layer, message) }
         )
     }
 
     private func readBattery(deviceIndex: UInt8) throws -> HIDPPProtocol.BatteryInfo {
-        stateLock.lock()
-        let cachedFeature = batteryFeatures[deviceIndex]
-        stateLock.unlock()
+        let cachedFeature = try mutateSession { $0.batteryFeatures[deviceIndex] }
 
         let feature: HIDPPProtocol.BatteryFeature
         if let cachedFeature {
             feature = cachedFeature
         } else {
             feature = try discoverBatteryFeature(deviceIndex: deviceIndex)
-            stateLock.lock()
-            batteryFeatures[deviceIndex] = feature
-            stateLock.unlock()
+            try mutateSession { $0.batteryFeatures[deviceIndex] = feature }
         }
 
         let response = try call(
@@ -1233,59 +1207,32 @@ final class HIDPPController {
         timeout: TimeInterval,
         quietly: Bool = false
     ) throws -> [UInt8] {
-        guard let channel = currentChannel() else {
-            throw HIDPPControllerError.noHIDPPChannel
-        }
-        return try requestSession.send(
-            device: channel.device,
-            transport: channel.transport,
-            deviceIndex: deviceIndex,
-            featureIndex: featureIndex,
-            functionID: functionID,
-            payload: payload,
-            timeout: timeout,
-            quietly: quietly,
-            log: log
-        )
+        try send(.feature(
+            deviceIndex: deviceIndex, featureIndex: featureIndex,
+            functionID: functionID, payload: payload, timeout: timeout, quietly: quietly
+        ))
     }
 
-    // MARK: - Event-driven verification and reconnect
-
-    /// Schedules at most one recovery for one device lifecycle event. Failure
-    /// intentionally does not recurse; outside the bounded application-level
-    /// wake retry policy, the next BLE arrival, Receiver 0x41 notification or
-    /// explicit window-open verification is required.
-    private func scheduleReacquire(after delay: TimeInterval) {
-        operationQueue.async { [weak self] in
-            guard let self, !self.reacquireAttemptScheduled else { return }
-            self.reacquireAttemptScheduled = true
-            self.operationQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self else { return }
-                self.reacquireAttemptScheduled = false
-                guard self.isTakeoverRequested,
-                      self.currentDevice() != nil,
-                      !self.hasActiveWheel else {
-                    return
-                }
-                do {
-                    let ready = try self.performTakeover(knownRouteOnly: false)
-                    self.log("hidpp_reacquire_ready", ready.description)
-                } catch {
-                    self.transition(to: .failed(error.localizedDescription))
-                    self.log("hidpp_reacquire_failed", error.localizedDescription)
-                }
-            }
-        }
+    private func callReceiverRegister(
+        subID: UInt8, address: UInt8, parameters: [UInt8], timeout: TimeInterval
+    ) throws -> [UInt8] {
+        try send(.receiverRegister(
+            subID: subID, address: address, parameters: parameters, timeout: timeout
+        ))
     }
 
-    /// Reads both physical sensor modes and repairs drift only after comparing
-    /// firmware state. Any missing response invalidates verified suppression
-    /// immediately; a later device event or window open may trigger recovery.
+    private func send(_ request: HIDPPCommandChannel.Request) throws -> [UInt8] {
+        guard let route = operationRoute else { throw HIDPPControllerError.noHIDPPChannel }
+        try validate(route)
+        let response = try route.channel.send(request)
+        try validate(route)
+        return response
+    }
+
+    /// Reads and repairs both modes on the pinned route. Verification evidence
+    /// may be revoked independently from the saved pre-takeover modes.
     private func verifyActiveMode() throws -> HIDPPTakeoverAxes {
-        stateLock.lock()
-        let activeWheel = self.activeWheel
-        let activeThumbwheel = self.activeThumbwheel
-        stateLock.unlock()
+        let (activeWheel, activeThumbwheel) = try mutateSession { ($0.activeWheel, $0.activeThumbwheel) }
         guard let activeWheel else { throw HIDPPControllerError.deviceNotFound }
 
         let desiredMode = HIDPPProtocol.WheelMode.divertedHighResolution
@@ -1352,11 +1299,12 @@ final class HIDPPController {
                     log("hidpp_thumbwheel_mode_reasserted", thumbwheelReadBack.description)
                 }
             }
-            stateLock.lock()
-            verifiedTakeoverAxes.vertical = true
-            verifiedTakeoverAxes.horizontal = activeThumbwheel != nil
-            let axes = verifiedTakeoverAxes
-            stateLock.unlock()
+            let axes = try mutateSession {
+                $0.verifiedTakeoverAxes = HIDPPTakeoverAxes(
+                    vertical: true, horizontal: activeThumbwheel != nil
+                )
+                return $0.verifiedTakeoverAxes
+            }
             publishTakeoverAxes(axes)
             transition(to: .ready(
                 deviceIndex: activeWheel.deviceIndex,
@@ -1365,17 +1313,10 @@ final class HIDPPController {
             ))
             return axes
         } catch {
-            // A missing response means the active mouse is gone or asleep.
-            // Bluetooth arrival, Receiver 0x41 or reopening the control window
-            // will trigger one recovery attempt.
-            stateLock.lock()
-            self.activeWheel = nil
-            self.activeThumbwheel = nil
-            self.featureIndices.removeAll()
-            self.thumbwheelFeatureIndices.removeAll()
-            self.verifiedTakeoverAxes = .none
-            stateLock.unlock()
-            publishTakeoverAxes(.none)
+            // Timeout alone cannot prove that firmware returned to native mode.
+            // Keep restoration snapshots; the coordinator owns recovery policy.
+            // A lost reply invalidates evidence, not the obligation to restore.
+            invalidateVerifiedTakeoverAxes()
             transition(to: .unavailable)
             log("hidpp_mode_verification_failed", error.localizedDescription)
             throw error
@@ -1383,16 +1324,6 @@ final class HIDPPController {
     }
 
     // MARK: - Thread-safe state helpers
-
-    private func currentDevice() -> IOHIDDevice? {
-        currentChannel()?.device
-    }
-
-    private func currentChannel() -> Channel? {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return selectedChannelLocked()
-    }
 
     private func currentTransport() -> HIDPPTransport? {
         stateLock.lock()
@@ -1403,13 +1334,13 @@ final class HIDPPController {
     private func routeIsCurrent(_ generation: UInt64) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return generation == routeGeneration && selectedChannelLocked() != nil
+        return generation == session.generation && selectedChannelLocked() != nil
     }
 
     private func selectedChannelIsCurrent(key: UInt, generation: UInt64) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return generation == routeGeneration && selectedChannelKey == key
+        return generation == session.generation && session.channelKey == key
     }
 
     private func preferredChannelKeyLocked() -> UInt? {
@@ -1421,9 +1352,9 @@ final class HIDPPController {
         }?.key
     }
 
-    private func selectedChannelLocked() -> Channel? {
-        guard let selectedChannelKey else { return nil }
-        return channels[selectedChannelKey]
+    private func selectedChannelLocked() -> HIDPPCommandChannel? {
+        guard let key = session.channelKey else { return nil }
+        return channels[key]
     }
 
     /// Route addresses are valid only within one physical transport. Clearing
@@ -1431,15 +1362,15 @@ final class HIDPPController {
     /// being written to a Bluetooth device (or the reverse). For Bluetooth the
     /// direct route is known up-front, while feature indices remain discoverable.
     private func resetRouteStateLocked(for transport: HIDPPTransport?) {
-        observedDeviceIndex = transport?.directDeviceIndex
-        receiverConnectionEdges.reset()
-        featureIndices.removeAll()
-        thumbwheelFeatureIndices.removeAll()
-        batteryFeatures.removeAll()
-        activeWheel = nil
-        activeThumbwheel = nil
-        verifiedTakeoverAxes = .none
-        routeGeneration &+= 1
+        session.observedDeviceIndex = transport?.directDeviceIndex
+        session.receiverConnectionEdges.reset()
+        session.featureIndices.removeAll()
+        session.thumbwheelFeatureIndices.removeAll()
+        session.batteryFeatures.removeAll()
+        session.activeWheel = nil
+        session.activeThumbwheel = nil
+        session.verifiedTakeoverAxes = .none
+        session.generation &+= 1
     }
 
     private func cancelPendingRequest() {
@@ -1449,55 +1380,127 @@ final class HIDPPController {
     private var hasActiveWheel: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return activeWheel != nil
+        return session.activeWheel != nil
     }
 
-    private var isTakeoverRequested: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return takeoverRequested
-    }
-
-    private func setTakeoverRequested(_ requested: Bool) {
-        stateLock.lock()
-        takeoverRequested = requested
-        stateLock.unlock()
-    }
-
-    private func setVerifiedTakeoverAxis(_ axis: ScrollAxis, enabled: Bool) {
-        stateLock.lock()
-        switch axis {
-        case .vertical: verifiedTakeoverAxes.vertical = enabled
-        case .horizontal: verifiedTakeoverAxes.horizontal = enabled
+    private func setVerifiedTakeoverAxis(_ axis: ScrollAxis, enabled: Bool) throws {
+        let axes = try mutateSession {
+            switch axis {
+            case .vertical: $0.verifiedTakeoverAxes.vertical = enabled
+            case .horizontal: $0.verifiedTakeoverAxes.horizontal = enabled
+            }
+            return $0.verifiedTakeoverAxes
         }
-        let axes = verifiedTakeoverAxes
-        stateLock.unlock()
         publishTakeoverAxes(axes)
     }
 
     private func invalidateVerifiedTakeoverAxes() {
-        stateLock.lock()
-        let changed = !verifiedTakeoverAxes.isEmpty
-        verifiedTakeoverAxes = .none
-        stateLock.unlock()
+        guard let changed = try? mutateSession({
+            let changed = !$0.verifiedTakeoverAxes.isEmpty
+            $0.verifiedTakeoverAxes = .none
+            return changed
+        }) else { return }
         if changed { publishTakeoverAxes(.none) }
     }
 
     private func publishTakeoverAxes(_ axes: HIDPPTakeoverAxes) {
-        DispatchQueue.main.async { [weak self] in
-            self?.onTakeoverAxesChange?(axes)
-        }
+        publish { $0.onTakeoverAxesChange?(axes) }
     }
 
     private func publishBatteryState(_ state: HIDPPBatteryState) {
-        DispatchQueue.main.async { [weak self] in
-            self?.onBatteryStateChange?(state)
-        }
+        publish { $0.onBatteryStateChange?(state) }
     }
 
     private func transition(to state: State) {
+        publish { $0.onStateChange?(state) }
+    }
+
+    private func publish(
+        generation expectedGeneration: UInt64? = nil,
+        _ callback: @escaping (HIDPPController) -> Void
+    ) {
+        let generation: UInt64
+        if let expectedGeneration {
+            generation = expectedGeneration
+        } else if DispatchQueue.getSpecific(key: operationQueueKey) != nil,
+           let route = operationRoute {
+            generation = route.generation
+        } else {
+            stateLock.lock()
+            generation = session.generation
+            stateLock.unlock()
+        }
         DispatchQueue.main.async { [weak self] in
-            self?.onStateChange?(state)
+            guard let self else { return }
+            self.stateLock.lock()
+            let current = self.session.generation == generation
+            self.stateLock.unlock()
+            if current { callback(self) }
+        }
+    }
+
+    private func currentRoute() -> Route? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let channel = selectedChannelLocked() else { return nil }
+        return Route(channel: channel, generation: session.generation)
+    }
+
+    private func validate(_ route: Route) throws {
+        guard selectedChannelIsCurrent(key: route.channel.key, generation: route.generation) else {
+            throw HIDPPControllerError.transportChanged
+        }
+    }
+
+    private func withRoute<T>(_ route: Route, operation: () throws -> T) throws -> T {
+        dispatchPrecondition(condition: .onQueue(operationQueue))
+        try validate(route)
+        operationRoute = route
+        defer { operationRoute = nil }
+        do {
+            let result = try operation()
+            try validate(route)
+            return result
+        } catch {
+            try validate(route)
+            throw error
+        }
+    }
+
+    private func mutateSession<T>(_ mutation: (inout HardwareSession) -> T) throws -> T {
+        dispatchPrecondition(condition: .onQueue(operationQueue))
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let route = operationRoute,
+              session.generation == route.generation,
+              session.channelKey == route.channel.key else {
+            throw HIDPPControllerError.transportChanged
+        }
+        return mutation(&session)
+    }
+
+    private func runOperation<T>(
+        route capturedRoute: Route? = nil,
+        completion: @escaping (Result<T, Error>) -> Void,
+        operation: @escaping () throws -> T
+    ) {
+        let route = capturedRoute ?? currentRoute()
+        operationQueue.async {
+            let result = Result {
+                guard let route else { throw HIDPPControllerError.noHIDPPChannel }
+                return try self.withRoute(route, operation: operation)
+            }
+            DispatchQueue.main.async {
+                // A queued successful completion is stale too if removal happened
+                // after the last read-back but before the main queue ran.
+                if let route, !self.selectedChannelIsCurrent(
+                    key: route.channel.key, generation: route.generation
+                ) {
+                    completion(.failure(HIDPPControllerError.transportChanged))
+                } else {
+                    completion(result)
+                }
+            }
         }
     }
 

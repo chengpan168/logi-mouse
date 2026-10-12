@@ -138,14 +138,8 @@ final class HIDMonitor {
         return hidQueue.sync(execute: work)
     }
 
-    func takeOverWheel(
-        preserveRequestOnFailure: Bool = false,
-        completion: @escaping (Result<HIDPPController.State, Error>) -> Void
-    ) {
-        controller.takeOverWheel(
-            preserveRequestOnFailure: preserveRequestOnFailure,
-            completion: completion
-        )
+    func takeOverWheel(completion: @escaping (Result<HIDPPController.State, Error>) -> Void) {
+        controller.takeOverWheel(completion: completion)
     }
 
     func restoreWheel(completion: @escaping (Result<HIDPPController.State, Error>) -> Void) {
@@ -342,11 +336,8 @@ final class HIDMonitor {
             // Restore hardware before cancelling the report callback: restore
             // requests need their 0x11 replies to wake HIDPPController.call().
             controller.restoreSynchronously()
-        } else {
-            // Reject late reports before cancelling the manager. The old
-            // controller generation must never recover independently.
-            controller.invalidateForSystemSleep()
         }
+        controller.invalidateSession()
 
         // Cancellation is asynchronous. The cancel handler owns final release;
         // a queue barrier alone cannot wait for IOKit's internal sources.
