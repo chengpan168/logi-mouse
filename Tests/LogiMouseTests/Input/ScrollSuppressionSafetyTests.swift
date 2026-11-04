@@ -60,9 +60,9 @@ import Foundation
 
 @Test func navigationShortcutsUseBracketKeyCodes() {
     // Constructing CGEventSource can block in a headless test runner. Keep the
-    // mapping pure here; makeEvents applies Command to both down/up events.
-    #expect(CGNavigationShortcutInjector.keyCode(for: .back) == 0x21)
-    #expect(CGNavigationShortcutInjector.keyCode(for: .forward) == 0x1e)
+    // default mapping pure here; the injector applies the configured modifiers.
+    #expect(KeyboardShortcut.browser(.back).keyCode == 0x21)
+    #expect(KeyboardShortcut.browser(.forward).keyCode == 0x1e)
 }
 
 @Test func syntheticEventSourcesPermitLocalHardwareInput() {

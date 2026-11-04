@@ -51,6 +51,17 @@ struct MouseRuntimeState: Equatable, Sendable {
         lifecycle == .running
     }
 
+    var monitoringFailureMessage: String? {
+        if case let .failed(message) = lifecycle { return message }
+        return nil
+    }
+
+    /// Startup failure has already released the monitors. Clearing saved user
+    /// intent in this state requires no writable device, just as before start.
+    var canDisableWithoutHardware: Bool {
+        lifecycle == .stopped || monitoringFailureMessage != nil
+    }
+
     /// The final suppression gate. User intent alone is never sufficient to
     /// suppress native scrolling; the active device session must be verified.
     func outputIsVerified(for axis: ScrollAxis) -> Bool {

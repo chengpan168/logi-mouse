@@ -7,6 +7,7 @@ struct MouseUserPreferences {
         // Keep the existing direction key so current users retain their choice.
         static let scrollDirection = "scroll-direction"
         static let smoothScrollingEnabled = "smooth-scrolling-enabled"
+        static let sideButtonSettings = "side-button-settings"
     }
 
     private let defaults: UserDefaults
@@ -31,5 +32,24 @@ struct MouseUserPreferences {
     var smoothScrollingEnabled: Bool {
         get { defaults.bool(forKey: Key.smoothScrollingEnabled) }
         nonmutating set { defaults.set(newValue, forKey: Key.smoothScrollingEnabled) }
+    }
+
+    var sideButtonSettings: SideButtonSettings {
+        get {
+            guard let data = defaults.data(forKey: Key.sideButtonSettings) else { return SideButtonSettings() }
+            do {
+                return try JSONDecoder().decode(SideButtonSettings.self, from: data)
+            } catch {
+                RuntimeLog.warning("preferences", "Cannot decode side-button settings; using browser defaults error=\(error)")
+                return SideButtonSettings()
+            }
+        }
+        nonmutating set {
+            do {
+                defaults.set(try JSONEncoder().encode(newValue), forKey: Key.sideButtonSettings)
+            } catch {
+                RuntimeLog.error("preferences", "Cannot save side-button settings error=\(error)")
+            }
+        }
     }
 }

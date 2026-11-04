@@ -1,3 +1,5 @@
+import AppKit
+import ApplicationServices
 import CoreGraphics
 import Foundation
 
@@ -118,10 +120,16 @@ enum CGScrollAxisClassifier {
 }
 
 enum CGEventMonitorError: LocalizedError {
+    case accessibilityPermissionDenied
     case tapCreationFailed
 
     var errorDescription: String? {
-        "无法创建全局输入监听。请检查输入监控和辅助功能权限，然后重新打开应用。"
+        switch self {
+        case .accessibilityPermissionDenied:
+            "辅助功能权限未生效。请在系统设置 → 隐私与安全性 → 辅助功能中启用 logi-mouse；若已开启，请移除旧条目并重新添加当前应用，然后退出并重新打开应用。"
+        case .tapCreationFailed:
+            "无法创建全局输入监听。请检查输入监控和辅助功能权限，然后重新打开应用。"
+        }
     }
 }
 
@@ -141,15 +149,19 @@ final class CGEventMonitor {
     var shouldSuppressVerticalScroll: (() -> Bool)?
     var shouldSuppressHorizontalScroll: (() -> Bool)?
     var scrollDiagnosticContext: (() -> String)?
+    var sideButtonSettings = SideButtonSettings()
 
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var suppressionEnabled = false
     private var diagnosticSamplesRemaining = 0
-    private var pressedNavigationButtons: Set<Int64> = []
+    private var sideButtonRouter = SideButtonRouter()
 
     func start(suppressionEnabled: Bool = false) throws {
         RuntimeLog.info("cg-event", "Starting CGEvent monitor suppressionEnabled=\(suppressionEnabled)")
+        let accessibilityTrusted = AXIsProcessTrusted()
+        RuntimeLog.info("cg-event", "Accessibility permission trusted=\(accessibilityTrusted)")
+        guard accessibilityTrusted else { throw CGEventMonitorError.accessibilityPermissionDenied }
         self.suppressionEnabled = suppressionEnabled
         diagnosticSamplesRemaining = Self.diagnosticSampleLimit
         // Side-button remapping must suppress the original button press/release
@@ -174,7 +186,7 @@ final class CGEventMonitor {
                     // macOS disables slow or user-disabled taps. Re-enable it
                     // immediately, but pass this event through to fail safely.
                     if let tap = monitor.tap { CGEvent.tapEnable(tap: tap, enable: true) }
-                    monitor.pressedNavigationButtons.removeAll()
+                    monitor.sideButtonRouter.reset()
                     RuntimeLog.warning("cg-event", "CGEvent tap disabled type=\(type.rawValue); re-enabled immediately")
                     return Unmanaged.passUnretained(event)
                 }
@@ -237,7 +249,7 @@ final class CGEventMonitor {
             CFMachPortInvalidate(tap)
             self.tap = nil
         }
-        pressedNavigationButtons.removeAll()
+        sideButtonRouter.reset()
         if wasStarted {
             RuntimeLog.info("cg-event", "Stopped CGEvent monitor and invalidated tap")
         }
@@ -258,30 +270,28 @@ final class CGEventMonitor {
         event: CGEvent
     ) -> Unmanaged<CGEvent>? {
         let buttonNumber = event.getIntegerValueField(.mouseEventButtonNumber)
-        guard let action = CGSideButtonNavigation.action(buttonNumber: buttonNumber) else {
+        guard CGSideButtonNavigation.action(buttonNumber: buttonNumber) != nil else {
             return Unmanaged.passUnretained(event)
         }
 
-        switch type {
-        case .otherMouseDown:
-            pressedNavigationButtons.insert(buttonNumber)
-            RuntimeLog.debug("side-button", "Captured down button=\(buttonNumber) action=\(action)")
-        case .otherMouseUp:
-            guard pressedNavigationButtons.remove(buttonNumber) != nil else {
-                // If the tap started or was re-enabled while a button was held,
-                // suppress the unmatched release without triggering navigation.
-                RuntimeLog.warning("side-button", "Suppressed unmatched up button=\(buttonNumber) action=\(action)")
-                return nil
-            }
-            CGNavigationShortcutInjector.post(action)
-            RuntimeLog.info("side-button", "Injected browser navigation shortcut button=\(buttonNumber) action=\(action)")
-        default:
+        let application = NSWorkspace.shared.frontmostApplication
+        let decision = sideButtonRouter.handle(
+            buttonNumber: buttonNumber,
+            isDown: type == .otherMouseDown,
+            settings: sideButtonSettings,
+            bundleIdentifier: application?.bundleIdentifier,
+            frontmostPID: application?.processIdentifier
+        )
+        switch decision {
+        case .passThrough:
             return Unmanaged.passUnretained(event)
+        case .suppress:
+            return nil
+        case let .shortcut(shortcut, targetPID):
+            CGNavigationShortcutInjector.post(shortcut, targetPID: targetPID)
+            RuntimeLog.info("side-button", "Injected shortcut button=\(buttonNumber) app=\(application?.bundleIdentifier ?? "unknown") shortcut=\(shortcut.displayName)")
+            return nil
         }
-
-        // Never let Safari/WebKit receive the original button 3/4 events;
-        // otherwise it may dispatch a page click in addition to navigation.
-        return nil
     }
 
     private func recordDiagnosticSample(

@@ -1,6 +1,6 @@
 import AppKit
 
-/// Product-facing window: device transport, smooth scrolling and direction.
+/// Product-facing window: device transport, scrolling and per-app side buttons.
 final class MouseManagerWindowController: NSWindowController {
     /// The window observes one application-level runtime owner. Device
     /// presence, HID++ readiness and power transitions must not be managed by
@@ -30,13 +30,13 @@ final class MouseManagerWindowController: NSWindowController {
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "logi-mouse"
-        window.minSize = NSSize(width: 620, height: 380)
+        window.minSize = NSSize(width: 680, height: 700)
         window.center()
         super.init(window: window)
         buildInterface()
@@ -72,19 +72,32 @@ final class MouseManagerWindowController: NSWindowController {
     private func buildInterface() {
         guard let contentView = window?.contentView else { return }
 
-        let title = NSTextField(labelWithString: "鼠标滚动")
+        let title = NSTextField(labelWithString: "鼠标设置")
         title.font = .systemFont(ofSize: 24, weight: .semibold)
         let subtitle = NSTextField(
-            wrappingLabelWithString: "管理 Logitech 鼠标的平滑滚动、滚动方向和当前连接方式。"
+            wrappingLabelWithString: "管理 Logitech 鼠标的滚动、侧键和当前连接方式。"
         )
         subtitle.textColor = .secondaryLabelColor
 
         let deviceCard = makeDeviceCard()
         let settingsCard = makeSettingsCard()
+        let sideButtonCard = makeCard()
+        let sideButtonView = SideButtonSettingsView(settings: coordinator.sideButtonSettings)
+        sideButtonView.onChange = { [weak self] settings in self?.coordinator.setSideButtonSettings(settings) }
+        sideButtonView.translatesAutoresizingMaskIntoConstraints = false
+        if let cardContent = sideButtonCard.contentView {
+            cardContent.addSubview(sideButtonView)
+            NSLayoutConstraint.activate([
+                sideButtonView.leadingAnchor.constraint(equalTo: cardContent.leadingAnchor),
+                sideButtonView.trailingAnchor.constraint(equalTo: cardContent.trailingAnchor),
+                sideButtonView.topAnchor.constraint(equalTo: cardContent.topAnchor),
+                sideButtonView.bottomAnchor.constraint(equalTo: cardContent.bottomAnchor),
+            ])
+        }
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.maximumNumberOfLines = 2
 
-        let stack = NSStackView(views: [title, subtitle, deviceCard, settingsCard, statusLabel])
+        let stack = NSStackView(views: [title, subtitle, deviceCard, settingsCard, sideButtonCard, statusLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
@@ -99,6 +112,7 @@ final class MouseManagerWindowController: NSWindowController {
             subtitle.widthAnchor.constraint(equalTo: stack.widthAnchor),
             deviceCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
             settingsCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            sideButtonCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
             statusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
 
@@ -275,7 +289,8 @@ final class MouseManagerWindowController: NSWindowController {
     private func enableSmoothScrolling() {
         guard coordinator.isRunning else {
             smoothScrollingSwitch.state = .off
-            showError("滚动服务尚未运行，请检查输入监控权限。")
+            showError(coordinator.runtimeState.monitoringFailureMessage
+                ?? "滚动服务尚未运行，请检查输入监控和辅助功能权限。")
             return
         }
         guard connection.supportsSmoothScrolling else {
@@ -322,7 +337,8 @@ final class MouseManagerWindowController: NSWindowController {
 
     private func finishSmoothDisable() {
         smoothScrollingSwitch.state = .off
-        statusLabel.stringValue = "平滑滚动已关闭，已恢复系统原生滚动"
+        statusLabel.stringValue = coordinator.runtimeState.monitoringFailureMessage
+            ?? "平滑滚动已关闭，已恢复系统原生滚动"
         RuntimeLog.notice("preferences", "Smooth scrolling disabled and persisted")
         setSmoothTransition(false)
     }

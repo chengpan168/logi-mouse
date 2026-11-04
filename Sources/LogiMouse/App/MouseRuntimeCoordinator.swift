@@ -1,5 +1,13 @@
 import Foundation
 
+enum MouseRuntimeError: LocalizedError {
+    case monitoringFailed(String)
+
+    var errorDescription: String? {
+        switch self { case let .monitoringFailed(message): message }
+    }
+}
+
 /// Application-level owner of mouse runtime state and side effects.
 ///
 /// The coordinator implements a small unidirectional state machine:
@@ -43,6 +51,7 @@ final class MouseRuntimeCoordinator {
     private var eventSequence: UInt64 = 0
     private var sleepBeganAt: Date?
     private(set) var scrollDirection: ScrollDirectionMapping = .natural
+    private(set) var sideButtonSettings: SideButtonSettings
     /// The only owner of high-frequency model state and native-scroll
     /// correlation. Keeping it outside the main actor prevents one task per HID
     /// report from competing with pointer event delivery.
@@ -50,6 +59,7 @@ final class MouseRuntimeCoordinator {
 
     init(preferences: MouseUserPreferences = MouseUserPreferences()) {
         self.preferences = preferences
+        sideButtonSettings = preferences.sideButtonSettings
         runtimeState.takeoverRequested = preferences.smoothScrollingEnabled
         scrollDirection = preferences.scrollDirection
         systemLifecycleMonitor.onWillSleep = { [weak self] in
@@ -69,6 +79,13 @@ final class MouseRuntimeCoordinator {
         if !runtimeState.takeoverRequested { onStatusChange?("已就绪") }
     }
 
+    func setSideButtonSettings(_ settings: SideButtonSettings) {
+        sideButtonSettings = settings
+        preferences.sideButtonSettings = settings
+        eventMonitor?.sideButtonSettings = settings
+        RuntimeLog.notice("preferences", "Side-button settings updated appRules=\(settings.applications.count)")
+    }
+
     func setTakeoverEnabled(
         _ enabled: Bool,
         completion: @escaping (Result<HIDPPController.State, Error>) -> Void
@@ -81,7 +98,7 @@ final class MouseRuntimeCoordinator {
             takeoverRetryWorkItem?.cancel()
             takeoverRetryWorkItem = nil
             if !isRunning {
-                guard runtimeState.lifecycle == .stopped else {
+                guard runtimeState.canDisableWithoutHardware else {
                     completion(.failure(HIDPPControllerError.noHIDPPChannel))
                     return
                 }
@@ -98,7 +115,11 @@ final class MouseRuntimeCoordinator {
                 "User takeover change rejected enabled=\(enabled) reason=no-active-hid-monitor "
                     + "state={\(runtimeDiagnosticSnapshot)}"
             )
-            completion(.failure(HIDPPControllerError.noHIDPPChannel))
+            if let message = runtimeState.monitoringFailureMessage {
+                completion(.failure(MouseRuntimeError.monitoringFailed(message)))
+            } else {
+                completion(.failure(HIDPPControllerError.noHIDPPChannel))
+            }
             return
         }
 
@@ -455,6 +476,7 @@ final class MouseRuntimeCoordinator {
         let connectionMonitor = DeviceConnectionMonitor()
         let hidMonitor = HIDMonitor()
         let eventMonitor = CGEventMonitor()
+        eventMonitor.sideButtonSettings = sideButtonSettings
         wire(
             connectionMonitor: connectionMonitor,
             hidMonitor: hidMonitor,

@@ -49,6 +49,31 @@ import Foundation
     #expect(!preferences.smoothScrollingEnabled)
 }
 
+@Test func startupFailureAllowsClearingSavedIntentAndPreservesPermissionError() {
+    let message = CGEventMonitorError.accessibilityPermissionDenied.localizedDescription
+    var reducer = MouseRuntimeReducer()
+    var state = MouseRuntimeState(takeoverRequested: true)
+    _ = reducer.reduce(state: &state, event: .startRequested)
+    _ = reducer.reduce(state: &state, event: .monitoringStartFailed(message: message, generation: state.generation))
+
+    #expect(state.canDisableWithoutHardware)
+    #expect(state.monitoringFailureMessage == message)
+    #expect(MouseRuntimeError.monitoringFailed(message).localizedDescription == message)
+    #expect(reducer.reduce(state: &state, event: .takeoverIntentChanged(false)).isEmpty)
+    #expect(!state.takeoverRequested)
+    #expect(state.monitoringFailureMessage == message)
+    #expect(!state.outputIsVerified(for: .vertical))
+    #expect(!state.outputIsVerified(for: .horizontal))
+}
+
+@Test(arguments: [
+    MouseRuntimeLifecycleState.starting, .running, .suspending, .suspended, .waking(attempt: 1), .stopping,
+]) func activeOrTransitioningRuntimeStillRequiresHardwareForDisable(lifecycle: MouseRuntimeLifecycleState) {
+    let state = MouseRuntimeState(lifecycle: lifecycle)
+    #expect(!state.canDisableWithoutHardware)
+    #expect(state.monitoringFailureMessage == nil)
+}
+
 @Test func sleepInvalidatesHardwareEvidenceButPreservesUserIntent() {
     var reducer = MouseRuntimeReducer()
     var state = MouseRuntimeState(

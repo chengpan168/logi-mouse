@@ -23,9 +23,6 @@ enum CGSideButtonNavigation {
 }
 
 enum CGNavigationShortcutInjector {
-    /// ANSI hardware key codes used by macOS for `[` and `]`.
-    private static let leftBracketKeyCode = CGKeyCode(0x21)
-    private static let rightBracketKeyCode = CGKeyCode(0x1e)
     static let eventMarker: Int64 = 0x4d58_4e41_5649_4741
 
     private static let source = CGEventSourceSafety.makeHIDSystemSource()
@@ -36,17 +33,8 @@ enum CGNavigationShortcutInjector {
         qos: .utility
     )
 
-    static func keyCode(for action: BrowserNavigationAction) -> CGKeyCode {
-        switch action {
-        case .back:
-            return leftBracketKeyCode
-        case .forward:
-            return rightBracketKeyCode
-        }
-    }
-
-    static func makeEvents(for action: BrowserNavigationAction) -> [CGEvent]? {
-        let keyCode = keyCode(for: action)
+    static func makeEvents(for shortcut: KeyboardShortcut) -> [CGEvent]? {
+        let keyCode = shortcut.keyCode
         guard let source,
               let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
               let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
@@ -54,20 +42,22 @@ enum CGNavigationShortcutInjector {
         }
 
         for event in [keyDown, keyUp] {
-            event.flags = [.maskCommand]
+            event.flags = shortcut.flags
             event.setIntegerValueField(.eventSourceUserData, value: eventMarker)
         }
         return [keyDown, keyUp]
     }
 
-    static func post(_ action: BrowserNavigationAction) {
+    static func post(_ shortcut: KeyboardShortcut, targetPID: pid_t) {
         queue.async {
-            guard let events = makeEvents(for: action) else {
-                RuntimeLog.error("side-button", "Failed to create browser navigation shortcut action=\(action)")
+            guard let events = makeEvents(for: shortcut) else {
+                RuntimeLog.error("side-button", "Failed to create shortcut keyCode=\(shortcut.keyCode)")
                 return
             }
             for event in events {
-                event.post(tap: .cghidEventTap)
+                // Keep queued output addressed to the app captured at press,
+                // even if focus changes after the event-tap callback returns.
+                event.postToPid(targetPID)
             }
         }
     }
