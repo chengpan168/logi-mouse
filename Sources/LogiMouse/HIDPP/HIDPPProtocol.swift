@@ -67,6 +67,8 @@ enum HIDPPProtocol {
     static let longReportLength = 20
     /// Root feature maps stable 16-bit IDs to runtime 8-bit feature indices.
     static let rootFeatureID: UInt16 = 0x0000
+    /// Device information includes a unit ID shared across transports.
+    static let deviceInformationFeatureID: UInt16 = 0x0003
     /// Main MagSpeed wheel: high-resolution movement and reporting-mode control.
     static let hiResWheelFeatureID: UInt16 = 0x2121
     /// Horizontal thumbwheel: raw rotation and reporting-mode control.
@@ -400,6 +402,20 @@ enum HIDPPProtocol {
             return nil
         }
         return FeatureInformation(index: report[4], type: report[5], version: report[6])
+    }
+
+    struct DeviceIdentity: Hashable, Sendable {
+        let unitID: UInt32
+        let modelID: [UInt8]
+    }
+
+    static func deviceIdentity(in report: [UInt8]) -> DeviceIdentity? {
+        guard report.count == longReportLength,
+              report[0] == longReportID, report[2] != 0xff else { return nil }
+        // Feature 0x0003 function 0: entityCount, unitId[4], transport[2], modelId[6].
+        let unitID = report[5..<9].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        guard unitID != 0, unitID != UInt32.max else { return nil }
+        return DeviceIdentity(unitID: unitID, modelID: Array(report[11..<17]))
     }
 
     static func wheelMode(in report: [UInt8]) -> WheelMode? {

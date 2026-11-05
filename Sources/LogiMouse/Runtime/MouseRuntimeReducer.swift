@@ -20,7 +20,10 @@ enum MouseRuntimeEvent: Sendable {
     case takeoverRecoveryRequested
     case takeoverStarted(generation: UInt64)
     case takeoverSucceeded(generation: UInt64)
-    case takeoverFailed(message: String, recoveryAttempt: Int?, generation: UInt64)
+    case takeoverFailed(
+        message: String, recoveryAttempt: Int?,
+        pendingRestorationAxes: HIDPPTakeoverAxes = .none, generation: UInt64
+    )
     case verificationStarted(generation: UInt64)
     case verificationSucceeded(HIDPPTakeoverAxes, generation: UInt64)
     case verificationFailed(message: String, generation: UInt64)
@@ -182,12 +185,13 @@ struct MouseRuntimeReducer {
             state.device = .ready(state.selectedTransport)
             return []
 
-        case let .takeoverFailed(message, recoveryAttempt, generation):
+        case let .takeoverFailed(message, recoveryAttempt, pendingRestorationAxes, generation):
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
             state.verifiedAxes = .none
             guard let recoveryAttempt else {
                 state.device = .failed(message)
-                return []
+                state.takeoverRequested = !pendingRestorationAxes.isEmpty
+                return pendingRestorationAxes.isEmpty ? [] : [.recoverTakeover(attempt: 1, generation: generation)]
             }
             let retryIndex = recoveryAttempt - 1
             guard retryIndex >= 0,
@@ -206,7 +210,8 @@ struct MouseRuntimeReducer {
         case let .verificationStarted(generation):
             guard acceptsRuntimeCallback(generation: generation, state: state) else { return [] }
             state.device = .verifying(state.selectedTransport)
-            state.verifiedAxes = .none
+            // A background read does not revoke previously verified modes.
+            // Drift, request failure and route changes revoke them explicitly.
             return []
 
         case let .verificationSucceeded(axes, generation):

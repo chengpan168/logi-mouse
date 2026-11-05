@@ -66,8 +66,11 @@ struct MouseRuntimeState: Equatable, Sendable {
     /// suppress native scrolling; the active device session must be verified.
     func outputIsVerified(for axis: ScrollAxis) -> Bool {
         guard lifecycle == .running,
-              case .ready = device,
               takeoverRequested else { return false }
+        switch device {
+        case .ready, .verifying: break
+        default: return false
+        }
         return switch axis {
         case .vertical: verifiedAxes.vertical
         case .horizontal: verifiedAxes.horizontal

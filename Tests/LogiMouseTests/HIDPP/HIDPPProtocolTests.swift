@@ -1,6 +1,27 @@
 import Testing
 @testable import LogiMouse
 
+@Test func deviceIdentityUsesUnitAndModelIDsRatherThanTransportAddresses() {
+    var report = [UInt8](repeating: 0, count: 20)
+    report[0] = 0x11
+    report[1] = 0xff
+    report[2] = 3
+    report[4] = 2
+    report.replaceSubrange(5..<9, with: [0x12, 0x34, 0x56, 0x78])
+    report.replaceSubrange(11..<17, with: [0xb0, 0x23, 0xb0, 0x24, 0x40, 0x82])
+    let identity = HIDPPProtocol.deviceIdentity(in: report)
+    #expect(identity?.unitID == 0x12345678)
+    #expect(identity?.modelID == [0xb0, 0x23, 0xb0, 0x24, 0x40, 0x82])
+    report[1] = 3
+    report[2] = 5
+    #expect(HIDPPProtocol.deviceIdentity(in: report) == identity)
+    report.replaceSubrange(5..<9, with: [0, 0, 0, 0])
+    #expect(HIDPPProtocol.deviceIdentity(in: report) == nil)
+    report.replaceSubrange(5..<9, with: [0xff, 0xff, 0xff, 0xff])
+    #expect(HIDPPProtocol.deviceIdentity(in: report) == nil)
+    #expect(HIDPPProtocol.deviceIdentity(in: Array(report.prefix(8))) == nil)
+}
+
 @Test func transportUsesReceiverSlotsAndBluetoothDirectIndex() {
     #expect(HIDPPTransport.usbReceiver.directDeviceIndex == nil)
     #expect(HIDPPTransport.bluetooth.directDeviceIndex == 0xff)

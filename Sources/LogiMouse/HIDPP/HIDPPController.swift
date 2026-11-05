@@ -79,6 +79,16 @@ struct HIDPPTakeoverAxes: Equatable, Sendable {
     var isComplete: Bool { vertical && horizontal }
 }
 
+/// A failed takeover is transactional only when every saved native mode was restored.
+struct HIDPPTakeoverFailure: LocalizedError {
+    let cause: Error
+    let pendingRestorationAxes: HIDPPTakeoverAxes
+
+    var errorDescription: String? {
+        "\(cause.localizedDescription) 原生滚动尚未确认恢复。"
+    }
+}
+
 enum HIDPPBatteryState: Equatable, Sendable {
     case unavailable
     case loading
@@ -157,6 +167,11 @@ final class HIDPPController {
         let restoreInverted: Bool
     }
 
+    private struct RestorationSnapshot {
+        var wheelMode: HIDPPProtocol.WheelMode?
+        var thumbwheelInverted: Bool?
+        var isEmpty: Bool { wheelMode == nil && thumbwheelInverted == nil }
+    }
 
     /// Serializes hardware requests, mode transactions and explicit verification.
     private let operationQueue: DispatchQueue
@@ -165,11 +180,16 @@ final class HIDPPController {
     /// Protects routing and mode state touched by IOKit and operationQueue.
     private let stateLock = NSLock()
     private var channels: [UInt: HIDPPCommandChannel] = [:]
+    // Native values outlive routes and monitor rebuilds, never their addresses.
+    // Accessed under stateLock through mutateSession.
+    private var restorationSnapshots: [HIDPPProtocol.DeviceIdentity: RestorationSnapshot] = [:]
     private struct HardwareSession {
         var generation: UInt64 = 0
         var channelKey: UInt?
         var receiverConnectionEdges = ReceiverConnectionEdgeTracker()
         var observedDeviceIndex: UInt8?
+        var pinnedDeviceIndex: UInt8?
+        var deviceIdentity: HIDPPProtocol.DeviceIdentity?
         var featureIndices: [UInt8: UInt8] = [:]
         var thumbwheelFeatureIndices: [UInt8: UInt8] = [:]
         var batteryFeatures: [UInt8: HIDPPProtocol.BatteryFeature] = [:]
@@ -189,7 +209,8 @@ final class HIDPPController {
     private var operationRoute: Route?
     private let operationQueueKey = DispatchSpecificKey<Void>()
 
-    init() {
+    init(onLog: ((String, String) -> Void)? = nil) {
+        self.onLog = onLog
         let queue = DispatchQueue(label: "dev.logi-mouse.hidpp-controller")
         operationQueue = queue
         deviceServices = HIDPPDeviceServiceCoordinator(operationQueue: queue)
@@ -345,6 +366,11 @@ final class HIDPPController {
             )
             return
         }
+        if let pinned = session.pinnedDeviceIndex, pinned != event.deviceIndex {
+            stateLock.unlock()
+            log("hidpp_receiver_event_ignored", "slot=\(event.deviceIndex) reason=other-mouse active_slot=\(pinned)")
+            return
+        }
         if !event.isConnected, session.observedDeviceIndex != event.deviceIndex {
             let observed = session.observedDeviceIndex.map(String.init) ?? "none"
             stateLock.unlock()
@@ -387,6 +413,8 @@ final class HIDPPController {
             session.thumbwheelFeatureIndices.removeAll()
             session.batteryFeatures.removeAll()
             session.verifiedTakeoverAxes = .none
+            session.pinnedDeviceIndex = nil
+            session.deviceIdentity = nil
             session.generation &+= 1
         }
         let routeGenerationSnapshot = session.generation
@@ -430,16 +458,24 @@ final class HIDPPController {
 
     func observeWheelRoute(deviceIndex: UInt8, featureIndex: UInt8) {
         stateLock.lock()
+        defer { stateLock.unlock() }
+        guard session.pinnedDeviceIndex == nil || session.pinnedDeviceIndex == deviceIndex else { return }
         session.observedDeviceIndex = deviceIndex
         session.featureIndices[deviceIndex] = featureIndex
-        stateLock.unlock()
     }
 
     func observeThumbwheelRoute(deviceIndex: UInt8, featureIndex: UInt8) {
         stateLock.lock()
+        defer { stateLock.unlock() }
+        guard session.pinnedDeviceIndex == nil || session.pinnedDeviceIndex == deviceIndex else { return }
         session.observedDeviceIndex = deviceIndex
         session.thumbwheelFeatureIndices[deviceIndex] = featureIndex
-        stateLock.unlock()
+    }
+
+    func acceptsDeviceIndex(_ deviceIndex: UInt8) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return session.pinnedDeviceIndex == nil || session.pinnedDeviceIndex == deviceIndex
     }
 
     /// Performs one read-back requested by a low-frequency lifecycle event,
@@ -495,6 +531,21 @@ final class HIDPPController {
                 }
                 self.invalidateVerifiedTakeoverAxes()
                 self.transition(to: .failed(error.localizedDescription))
+                let pendingAxes = try self.mutateSession { session in
+                    // Identity discovery may itself fail after wake. Retain the
+                    // outstanding obligation, without applying values to an
+                    // unidentified device or claiming native mode was restored.
+                    var axes = HIDPPTakeoverAxes.none
+                    for (identity, snapshot) in self.restorationSnapshots
+                    where session.deviceIdentity == nil || session.deviceIdentity == identity {
+                        axes.vertical = axes.vertical || snapshot.wheelMode != nil
+                        axes.horizontal = axes.horizontal || snapshot.thumbwheelInverted != nil
+                    }
+                    return axes
+                }
+                if !pendingAxes.isEmpty {
+                    throw HIDPPTakeoverFailure(cause: error, pendingRestorationAxes: pendingAxes)
+                }
                 throw error
             }
         }
@@ -552,6 +603,7 @@ final class HIDPPController {
         // Bluetooth always routes directly through 0xff. Resolve both feature
         // indices on every takeover instead of persisting addresses.
         let deviceIndex = try discoverDeviceIndex()
+        let identity = try identifyDevice(deviceIndex: deviceIndex)
         let feature = try discoverFeature(
             HIDPPProtocol.hiResWheelFeatureID,
             deviceIndex: deviceIndex,
@@ -570,12 +622,13 @@ final class HIDPPController {
         // snapshot an error path could leave the physical wheel diverted and
         // make native scrolling appear broken after logi-mouse exits.
         try mutateSession {
-            if $0.activeWheel == nil {
-                $0.activeWheel = ActiveWheel(
-                    deviceIndex: deviceIndex, featureIndex: feature.index,
-                    restoreMode: originalMode.nativeTarget
-                )
-            }
+            var snapshot = self.restorationSnapshots[identity] ?? RestorationSnapshot()
+            let restoreMode = snapshot.wheelMode ?? originalMode.nativeTarget
+            snapshot.wheelMode = restoreMode
+            self.restorationSnapshots[identity] = snapshot
+            $0.activeWheel = ActiveWheel(
+                deviceIndex: deviceIndex, featureIndex: feature.index, restoreMode: restoreMode
+            )
         }
 
         if originalMode != desiredMode {
@@ -615,12 +668,14 @@ final class HIDPPController {
             featureIndex: thumbwheelFeature.index
         )
         try mutateSession {
-            if $0.activeThumbwheel == nil {
-                $0.activeThumbwheel = ActiveThumbwheel(
-                    deviceIndex: deviceIndex, featureIndex: thumbwheelFeature.index,
-                    restoreInverted: originalThumbwheelStatus.directionInverted
-                )
-            }
+            var snapshot = self.restorationSnapshots[identity] ?? RestorationSnapshot()
+            let restoreInverted = snapshot.thumbwheelInverted ?? originalThumbwheelStatus.directionInverted
+            snapshot.thumbwheelInverted = restoreInverted
+            self.restorationSnapshots[identity] = snapshot
+            $0.activeThumbwheel = ActiveThumbwheel(
+                deviceIndex: deviceIndex, featureIndex: thumbwheelFeature.index,
+                restoreInverted: restoreInverted
+            )
         }
         if originalThumbwheelStatus != .diverted {
             try setThumbwheelReporting(
@@ -660,8 +715,15 @@ final class HIDPPController {
     /// attempting both. Returning after one failed sensor would unnecessarily
     /// strand the other sensor in diverted mode.
     private func performRestore() throws -> State {
+        var firstError: Error?
+        do {
+            try bindPendingRestoration()
+        } catch {
+            firstError = error
+        }
         let (activeWheel, activeThumbwheel) = try mutateSession { ($0.activeWheel, $0.activeThumbwheel) }
         guard activeWheel != nil || activeThumbwheel != nil else {
+            if let firstError { throw firstError }
             invalidateVerifiedTakeoverAxes()
             let transport = currentTransport()
             let newState: State = transport.map(State.channelReady) ?? .unavailable
@@ -671,7 +733,6 @@ final class HIDPPController {
 
         // Always attempt both restores. If one axis fails, returning early would
         // unnecessarily strand the other axis in diverted mode.
-        var firstError: Error?
         var restoredDescriptions: [String] = []
         if let activeThumbwheel {
             do {
@@ -696,13 +757,14 @@ final class HIDPPController {
                 }
                 let axes = try mutateSession {
                     $0.activeThumbwheel = nil
+                    self.clearRestorationAxis(.horizontal, identity: $0.deviceIdentity)
                     $0.verifiedTakeoverAxes.horizontal = false
                     return $0.verifiedTakeoverAxes
                 }
                 publishTakeoverAxes(axes)
                 restoredDescriptions.append("thumbwheel={\(readBack)}")
             } catch {
-                firstError = error
+                if firstError == nil { firstError = error }
             }
         }
         if let activeWheel {
@@ -730,6 +792,7 @@ final class HIDPPController {
                 }
                 let axes = try mutateSession {
                     $0.activeWheel = nil
+                    self.clearRestorationAxis(.vertical, identity: $0.deviceIdentity)
                     $0.verifiedTakeoverAxes.vertical = false
                     return $0.verifiedTakeoverAxes
                 }
@@ -753,7 +816,7 @@ final class HIDPPController {
     // MARK: - Feature discovery and commands
 
     private func discoverDeviceIndex() throws -> UInt8 {
-        let preferred = try mutateSession { $0.observedDeviceIndex }
+        let (preferred, pinned) = try mutateSession { ($0.observedDeviceIndex, $0.pinnedDeviceIndex) }
         let directIndex = operationRoute?.channel.transport.directDeviceIndex
         if let directIndex {
             return directIndex
@@ -764,8 +827,12 @@ final class HIDPPController {
         // known. The controller never loops on its own; the application-level
         // wake policy may explicitly request a bounded sequence of retries.
         var candidates: [UInt8] = []
-        if let preferred { candidates.append(preferred) }
-        candidates.append(contentsOf: (1...6).map(UInt8.init))
+        if let pinned {
+            candidates = [pinned]
+        } else {
+            if let preferred { candidates.append(preferred) }
+            candidates.append(contentsOf: (1...6).map(UInt8.init))
+        }
 
         var visited = Set<UInt8>()
         for index in candidates where visited.insert(index).inserted {
@@ -777,6 +844,7 @@ final class HIDPPController {
                 )
                 try mutateSession {
                     $0.observedDeviceIndex = index
+                    $0.pinnedDeviceIndex = index
                     $0.featureIndices[index] = feature.index
                 }
                 return index
@@ -789,6 +857,71 @@ final class HIDPPController {
             }
         }
         throw HIDPPControllerError.deviceNotFound
+    }
+
+    private func identifyDevice(deviceIndex: UInt8) throws -> HIDPPProtocol.DeviceIdentity {
+        if let identity = try mutateSession({ $0.deviceIdentity }) { return identity }
+        let feature = try discoverFeature(
+            HIDPPProtocol.deviceInformationFeatureID, deviceIndex: deviceIndex, timeout: 0.7
+        )
+        let response = try call(
+            deviceIndex: deviceIndex, featureIndex: feature.index, functionID: 0, payload: [], timeout: 0.7
+        )
+        guard let identity = HIDPPProtocol.deviceIdentity(in: response) else {
+            throw HIDPPControllerError.unexpectedResponse
+        }
+        try mutateSession { $0.deviceIdentity = identity }
+        return identity
+    }
+
+    /// Rebind retained values to freshly discovered addresses, including when OFF
+    /// is requested after wake before another takeover has started.
+    private func bindPendingRestoration() throws {
+        let needsBinding = try mutateSession { session in
+            guard !self.restorationSnapshots.isEmpty else { return false }
+            guard let identity = session.deviceIdentity else { return true }
+            guard let snapshot = self.restorationSnapshots[identity] else { return false }
+            return (snapshot.wheelMode != nil && session.activeWheel == nil)
+                || (snapshot.thumbwheelInverted != nil && session.activeThumbwheel == nil)
+        }
+        guard needsBinding else { return }
+        let deviceIndex = try mutateSession({ $0.pinnedDeviceIndex }) ?? discoverDeviceIndex()
+        let identity = try identifyDevice(deviceIndex: deviceIndex)
+        guard let snapshot = try mutateSession({ _ in self.restorationSnapshots[identity] }) else { return }
+        var firstError: Error?
+        if let mode = snapshot.wheelMode, try mutateSession({ $0.activeWheel == nil }) {
+            do {
+                let feature = try discoverFeature(
+                    HIDPPProtocol.hiResWheelFeatureID, deviceIndex: deviceIndex, timeout: 0.7
+                )
+                try mutateSession {
+                    $0.activeWheel = ActiveWheel(deviceIndex: deviceIndex, featureIndex: feature.index, restoreMode: mode)
+                }
+            } catch { firstError = error }
+        }
+        if let inverted = snapshot.thumbwheelInverted, try mutateSession({ $0.activeThumbwheel == nil }) {
+            do {
+                let feature = try discoverFeature(
+                    HIDPPProtocol.thumbwheelFeatureID, deviceIndex: deviceIndex, timeout: 0.7
+                )
+                try mutateSession {
+                    $0.activeThumbwheel = ActiveThumbwheel(
+                        deviceIndex: deviceIndex, featureIndex: feature.index, restoreInverted: inverted
+                    )
+                }
+            } catch { if firstError == nil { firstError = error } }
+        }
+        if let firstError { throw firstError }
+    }
+
+    /// Called only within a route-validated mutateSession critical section.
+    private func clearRestorationAxis(_ axis: ScrollAxis, identity: HIDPPProtocol.DeviceIdentity?) {
+        guard let identity, var snapshot = restorationSnapshots[identity] else { return }
+        switch axis {
+        case .vertical: snapshot.wheelMode = nil
+        case .horizontal: snapshot.thumbwheelInverted = nil
+        }
+        restorationSnapshots[identity] = snapshot.isEmpty ? nil : snapshot
     }
 
     private func discoverFeature(
@@ -1243,6 +1376,7 @@ final class HIDPPController {
                 quietly: true
             )
             if observed != desiredMode {
+                try setVerifiedTakeoverAxis(.vertical, enabled: false)
                 log(
                     "hidpp_mode_drift_detected",
                     "observed={\(observed)} expected={\(desiredMode)}"
@@ -1277,6 +1411,7 @@ final class HIDPPController {
                     quietly: true
                 )
                 if thumbwheelObserved != .diverted {
+                    try setVerifiedTakeoverAxis(.horizontal, enabled: false)
                     log(
                         "hidpp_thumbwheel_mode_drift_detected",
                         "observed={\(thumbwheelObserved)} expected={\(HIDPPProtocol.ThumbwheelStatus.diverted)}"
@@ -1363,6 +1498,8 @@ final class HIDPPController {
     /// direct route is known up-front, while feature indices remain discoverable.
     private func resetRouteStateLocked(for transport: HIDPPTransport?) {
         session.observedDeviceIndex = transport?.directDeviceIndex
+        session.pinnedDeviceIndex = transport?.directDeviceIndex
+        session.deviceIdentity = nil
         session.receiverConnectionEdges.reset()
         session.featureIndices.removeAll()
         session.thumbwheelFeatureIndices.removeAll()

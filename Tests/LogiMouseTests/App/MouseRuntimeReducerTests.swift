@@ -316,6 +316,50 @@ import Foundation
     #expect(state.takeoverRequested)
 }
 
+@Test func userTakeoverFailureWithIncompleteRollbackPreservesIntentAndRecovers() {
+    var reducer = MouseRuntimeReducer()
+    var state = MouseRuntimeState(
+        lifecycle: .running, device: .configuring(.bluetooth), takeoverRequested: true,
+        generation: 1, selectedTransport: .bluetooth
+    )
+    let effects = reducer.reduce(state: &state, event: .takeoverFailed(
+        message: "rollback incomplete", recoveryAttempt: nil,
+        pendingRestorationAxes: HIDPPTakeoverAxes(horizontal: true), generation: 1
+    ))
+    #expect(state.takeoverRequested)
+    #expect(state.verifiedAxes.isEmpty)
+    #expect(!state.outputIsVerified(for: .horizontal))
+    #expect(effects == [.recoverTakeover(attempt: 1, generation: 1)])
+}
+
+@Test func userTakeoverFailureWithCompleteRollbackCommitsOffWithoutRetry() {
+    var reducer = MouseRuntimeReducer()
+    var state = MouseRuntimeState(
+        lifecycle: .running, device: .configuring(.bluetooth), takeoverRequested: true,
+        generation: 1, selectedTransport: .bluetooth
+    )
+    let effects = reducer.reduce(state: &state, event: .takeoverFailed(
+        message: "takeover failed, rollback complete", recoveryAttempt: nil, generation: 1
+    ))
+    #expect(!state.takeoverRequested)
+    #expect(state.verifiedAxes.isEmpty)
+    #expect(effects.isEmpty)
+}
+
+@Test func verificationPreservesOnlyExistingEvidenceAndRouteChangeRevokesIt() {
+    var reducer = MouseRuntimeReducer()
+    var state = MouseRuntimeState(
+        lifecycle: .running, device: .ready(.bluetooth), takeoverRequested: true,
+        verifiedAxes: HIDPPTakeoverAxes(vertical: true), generation: 1, selectedTransport: .bluetooth
+    )
+    _ = reducer.reduce(state: &state, event: .verificationStarted(generation: 1))
+    #expect(state.outputIsVerified(for: .vertical))
+    #expect(!state.outputIsVerified(for: .horizontal))
+    _ = reducer.reduce(state: &state, event: .controllerState(.unavailable, generation: 1))
+    #expect(state.verifiedAxes.isEmpty)
+    #expect(!state.outputIsVerified(for: .vertical))
+}
+
 @Test func takeoverRetryTimerNeverDependsOnWheelInput() {
     var reducer = MouseRuntimeReducer()
     var state = MouseRuntimeState(
@@ -361,7 +405,9 @@ import Foundation
 
     _ = reducer.reduce(state: &state, event: .verificationStarted(generation: 4))
     #expect(state.device == .verifying(.bluetooth))
-    #expect(state.verifiedAxes.isEmpty)
+    #expect(state.verifiedAxes.isComplete)
+    #expect(state.outputIsVerified(for: .vertical))
+    #expect(state.outputIsVerified(for: .horizontal))
 
     let axes = HIDPPTakeoverAxes(vertical: true, horizontal: true)
     _ = reducer.reduce(

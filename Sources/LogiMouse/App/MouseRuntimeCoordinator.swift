@@ -41,6 +41,13 @@ final class MouseRuntimeCoordinator {
     private let systemLifecycleMonitor = SystemLifecycleMonitor()
     private var connectionMonitor: DeviceConnectionMonitor?
     private var hidMonitor: HIDMonitor?
+    private let hidController = HIDPPController { layer, message in
+        if layer.contains("failed") || layer.contains("exhausted") || layer.contains("timeout") {
+            RuntimeLog.warning("hidpp", "layer=\(layer) \(message)")
+        } else {
+            RuntimeLog.debug("hidpp", "layer=\(layer) \(message)")
+        }
+    }
     private var eventMonitor: CGEventMonitor?
     private var wakeRetryWorkItem: DispatchWorkItem?
     private var takeoverRetryWorkItem: DispatchWorkItem?
@@ -158,14 +165,12 @@ final class MouseRuntimeCoordinator {
                         "User takeover failed generation=\(generation) error=\(error.localizedDescription) "
                             + "state={\(self.runtimeDiagnosticSnapshot)}"
                     )
-                    // A direct user action is transactional: failure returns the
-                    // switch to OFF. Sleep recovery uses a separate effect that
-                    // deliberately preserves intent across bounded failures.
-                    self.preferences.smoothScrollingEnabled = false
-                    try? self.send(.takeoverIntentChanged(false))
+                    let pendingAxes = (error as? HIDPPTakeoverFailure)?.pendingRestorationAxes ?? .none
+                    self.preferences.smoothScrollingEnabled = !pendingAxes.isEmpty
                     try? self.send(.takeoverFailed(
                         message: error.localizedDescription,
                         recoveryAttempt: nil,
+                        pendingRestorationAxes: pendingAxes,
                         generation: generation
                     ))
                 }
@@ -474,7 +479,7 @@ final class MouseRuntimeCoordinator {
         stopRuntimeMonitors(restoringHardware: false)
 
         let connectionMonitor = DeviceConnectionMonitor()
-        let hidMonitor = HIDMonitor()
+        let hidMonitor = HIDMonitor(controller: hidController)
         let eventMonitor = CGEventMonitor()
         eventMonitor.sideButtonSettings = sideButtonSettings
         wire(

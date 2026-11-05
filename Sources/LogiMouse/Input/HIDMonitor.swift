@@ -102,13 +102,14 @@ final class HIDMonitor {
         qos: .userInitiated
     )
     private let hidQueueKey = DispatchSpecificKey<Void>()
-    private let controller = HIDPPController()
+    private let controller: HIDPPController
     private var manager: IOHIDManager?
     private var managerIsOpen = false
     private var pendingDevices: [UInt: PendingDevice] = [:]
     private var acceptingReports = false
 
-    init() {
+    init(controller: HIDPPController) {
+        self.controller = controller
         hidQueue.setSpecific(key: hidQueueKey, value: ())
         controller.onStateChange = { [weak self] state in
             self?.onControllerStateChange?(state)
@@ -118,13 +119,6 @@ final class HIDMonitor {
         }
         controller.onBatteryStateChange = { [weak self] state in
             self?.onBatteryStateChange?(state)
-        }
-        controller.onLog = { layer, message in
-            if layer.contains("failed") || layer.contains("exhausted") || layer.contains("timeout") {
-                RuntimeLog.warning("hidpp", "layer=\(layer) \(message)")
-            } else {
-                RuntimeLog.debug("hidpp", "layer=\(layer) \(message)")
-            }
         }
     }
 
@@ -318,7 +312,7 @@ final class HIDMonitor {
     /// A system-sleep notification can arrive after the mouse radio or USB stack
     /// has already stopped answering. Calling `restoreSynchronously()` there
     /// would delay sleep until request timeout. User intent is retained by the
-    /// runtime coordinator and a fresh controller reapplies it after wake.
+    /// runtime coordinator; its controller retains native values across rebuilds.
     func suspend() {
         teardown(restoringHardware: false)
     }
@@ -419,6 +413,7 @@ final class HIDMonitor {
               reportBytes.first == HIDPPProtocol.longReportID else { return }
 
         let deviceIndex = reportBytes.count > 1 ? reportBytes[1] : 0
+        guard controller.acceptsDeviceIndex(deviceIndex) else { return }
         let eventTimestamp = MonotonicClock.toNanoseconds(timestamp)
 
         let wheelEvent = HIDPPReportDecoder.decodeWheelEvent(
